@@ -1,0 +1,331 @@
+// bigmod — arithmetic in the ring of integers modulo n, which is the
+// half of this package the crypto tier is here for.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE LOAD-BEARING INTERFACE IS `BigMont`, AND IT IS A VALUE THE CALLER
+// BUILDS ONCE PER MODULUS.  Montgomery form replaces a division by n
+// with a multiply and a shift, which is what makes modular
+// exponentiation affordable at all; the price is a setup — computing
+// `n'`, the negated inverse of n modulo the limb base, and `R^2 mod n`
+// for the conversion in — that costs more than a single reduction.  An
+// API where every call re-derived it would be slower than one that
+// never used Montgomery form.  So the setup is a value: `montgomery(n)`
+// once, then `mont_mul`, `mont_sqr` and `mont_pow` against it as many
+// times as the protocol needs.  An RSA signature verification is one
+// context and 17 squarings; an RSA signature is one context and about
+// 3000 operations; a caller that built the context inside the loop
+// would pay the setup 3000 times and would never know why it was slow.
+//
+// THAT SHAPE IS WHY THIS PACKAGE IS WORTH HAVING AT `core` AT ALL.
+// Every operation here is a pure function of values the caller holds:
+// no allocation the caller cannot see, no clock, no entropy, no
+// scratch state carried between calls.  A `core` package with a
+// per-modulus context could have been a mutable handle with an `init`
+// and a `free`; it is a value instead, and the whole budget follows
+// from that one decision.
+//
+// CONSTANT TIME IS A CLAIM, AND IT IS MADE FUNCTION BY FUNCTION.  Three
+// names carry `_ct`: `pow_ct`, `mont_pow_ct` and `select_ct`.  Those
+// are the ones whose running time and memory access pattern do not
+// depend on the secret they are given — a fixed square-and-multiply
+// ladder that performs the multiply at every bit and discards it when
+// the bit is 0, and a select that reads both arms.  Every OTHER
+// function here is variable time and says so in its own comment: `pow`
+// skips zero bits, `inverse` and `gcd` are extended Euclid and branch
+// on the values, `reduce` divides.  A secret exponent goes through a
+// `_ct` function or it leaks; a public one does not need to.
+//
+// AND THE CLAIM IS BOUNDED BY WHAT THIS LANGUAGE CAN PROMISE.  A
+// constant-time claim in a high-level language is a claim about the
+// algorithm, not about the machine: nothing here can stop a compiler
+// from turning a branchless select back into a branch, and nothing here
+// can keep a value out of a cache line.  The claim is that the
+// ALGORITHM performs the same operations in the same order whatever the
+// secret bits are, which is the part a library can be responsible for.
+// The implementation lane owes a test that counts operations, and the
+// README says so.
+
+// ── plain modular arithmetic ────────────────────────────────────────
+
+// `a mod n`, the least non-negative residue.
+//
+// `BigZeroModulus` when n is zero.  Variable time: it is a division.
+//
+// ```novo
+// use bignum
+// use bigfmt
+// use bigmod
+//
+// fn main() [io]
+//     match bignum.nat_from_int(17)
+//         Ok(a) =>
+//             match bignum.nat_from_int(5)
+//                 Ok(n) =>
+//                     match bigmod.reduce(a, n)
+//                         Ok(r) => println(bigfmt.nat_to_decimal(r))   // 2
+//                         Err(e) => println(e.message())
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn reduce(a: BigNat, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.reduce")
+
+// A SIGNED number reduced into `0 ..= n - 1`.
+//
+// The floored remainder, not the truncated one, which is why it exists
+// beside `reduce`: `of_num(-1, 7)` is 6 and not -1.  Written in terms
+// of `bignum.floordivmod` for exactly that reason.
+pub fn of_num(a: BigNum, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.of_num")
+
+// `(a + b) mod n`, for `a` and `b` already reduced.
+//
+// A single conditional subtraction rather than a division, because both
+// operands are below n — so this is cheap and the precondition is what
+// makes it cheap.  An unreduced operand gives a wrong answer rather
+// than a refusal: the function cannot tell, and checking would cost the
+// division this call exists to avoid.
+pub fn add(a: BigNat, b: BigNat, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.add")
+
+// `(a - b) mod n`, for `a` and `b` already reduced.  A conditional
+// addition; the same precondition as `add`.
+pub fn sub(a: BigNat, b: BigNat, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.sub")
+
+// `(a * b) mod n`.
+//
+// A full multiply and a division.  A caller doing this in a loop wants
+// `mont_mul` against a `BigMont` instead, which is the same answer for
+// a fraction of the cost once the context is built.
+pub fn mul(a: BigNat, b: BigNat, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.mul")
+
+// `(a * a) mod n`.  `bignum.nat_sqr` and a division.
+pub fn sqr(a: BigNat, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.sqr")
+
+// `(-a) mod n`, for `a` already reduced: `n - a`, and 0 for 0.
+pub fn neg(a: BigNat, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.neg")
+
+// `base^exponent mod n`, by square-and-multiply over the exponent's
+// bits.
+//
+// VARIABLE TIME, and the variation is in the exponent: a set bit costs
+// a multiply and a clear bit does not, so the running time reveals the
+// exponent's Hamming weight and its length.  Fine for a public
+// exponent — RSA's 65537, a Diffie-Hellman group check — and NOT fine
+// for a private one.  `pow_ct` is the other one.
+//
+// `BigZeroModulus` for a zero modulus.
+pub fn pow(base: BigNat, exponent: BigNat, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.pow")
+
+// `base^exponent mod n` in CONSTANT TIME with respect to the exponent.
+//
+// A fixed ladder: every bit position performs a squaring and a
+// multiplication, and `select_ct` chooses whether the multiplication's
+// result or the untouched accumulator continues — so the operation
+// sequence depends on the exponent's declared WIDTH and on nothing
+// else.  `width` is that declared width in bits, and it is an argument
+// rather than `bignum.bit_len(exponent)` precisely because the bit
+// length of a secret is itself secret: an RSA private exponent is
+// "2048 bits" by the key's size, not by where its top set bit happens
+// to be.
+//
+// `BigWidthExceeded` when the exponent does not fit `width`.
+//
+// The modulus is not secret in any protocol this serves, so the
+// reduction inside is the ordinary one.
+pub fn pow_ct(base: BigNat, exponent: BigNat, width: Int, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.pow_ct")
+
+// The modular inverse of `a` modulo `n`: the `x` in `0 ..= n - 1` with
+// `a * x ≡ 1 (mod n)`.
+//
+// The binary extended Euclidean algorithm.  `BigNotInvertible` when `a`
+// and `n` share a factor — which in an RSA key generator is not a
+// failure but a fact worth having, because it means the candidate was
+// not coprime with the totient and the next candidate is the answer.
+//
+// VARIABLE TIME: extended Euclid branches on the values it is reducing,
+// so the running time depends on both operands.  There is no constant
+// time inverse here, and the reason is that the crypto tier does not
+// need one at this layer — an inverse modulo a PRIME is
+// `pow_ct(a, n - 2, width, n)` by Fermat's little theorem, which is
+// constant time already, and that is the call a curve implementation
+// makes.  `bigmod.inverse` is for key generation and for CRT
+// parameters, which run once and not against an attacker's clock.
+//
+// ```novo
+// use bignum
+// use bigfmt
+// use bigmod
+//
+// fn main() [io]
+//     match bignum.nat_from_int(3)
+//         Ok(a) =>
+//             match bignum.nat_from_int(11)
+//                 Ok(n) =>
+//                     match bigmod.inverse(a, n)
+//                         Ok(x) => println(bigfmt.nat_to_decimal(x))   // 4
+//                         Err(e) => println(e.message())
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn inverse(a: BigNat, n: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.inverse")
+
+// The greatest common divisor of `a` and `n`.
+//
+// Here rather than only in `bignum` because it is what
+// `BigNotInvertible` does not carry: a caller that met that refusal and
+// wants the shared factor asks this.  Variable time.
+pub fn gcd(a: BigNat, n: BigNat) -> BigNat []
+    todo("bigint-nv.bigmod.gcd")
+
+// Whichever of `a` and `b` the `choose` bit selects — `b` when it is 1
+// and `a` when it is 0 — reading BOTH and branching on neither.
+//
+// The primitive `pow_ct` is written on, published because every
+// constant-time loop above this package needs the same thing and
+// rewriting it per caller is how one of them ends up with an `if`.
+//
+// The two operands must already be the same limb length; a select
+// between values of different lengths would leak the length, which is
+// the one thing the caller is trying to hide.  `BigWidthExceeded` with
+// both lengths when they differ.
+pub fn select_ct(a: BigNat, b: BigNat, choose: Int) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.select_ct")
+
+// Whether two reduced values are equal, in time that does not depend on
+// where they first differ.
+//
+// The comparison a MAC check and a point-equality test both need.
+// Variable in the operands' LENGTH, which is public, and constant in
+// their contents.
+pub fn eq_ct(a: BigNat, b: BigNat) -> Bool []
+    todo("bigint-nv.bigmod.eq_ct")
+
+// ── Montgomery form ─────────────────────────────────────────────────
+
+// BigMont is everything about one modulus that a Montgomery
+// multiplication needs, computed once.
+//
+// Build it with `montgomery`, keep it as long as the modulus lives, and
+// pass it to `mont_mul`, `mont_sqr` and `mont_pow`.  It is a value: it
+// can be stored in a struct, copied, and used from two places, and
+// nothing about it changes after construction.
+//
+// The fields are public because a reader checking this implementation
+// against Handbook of Applied Cryptography § 14.36 needs to see them,
+// and because a test can then assert `r2` directly rather than only
+// through a round trip.
+pub struct BigMont
+    // The modulus.  Odd, and that is the requirement `montgomery`
+    // enforces.
+    modulus: BigNat
+    // How many limbs the modulus occupies.  `R` is `2^(limbs * 28)`.
+    limbs: Int
+    // `-n^-1 mod 2^28`: one limb, the multiplier the reduction step
+    // uses to clear the low limb.
+    n_prime: Int
+    // `R^2 mod n`, the constant that converts a value INTO Montgomery
+    // form with one multiplication.
+    r2: BigNat
+    // `R mod n`, which is Montgomery form's representation of 1 and the
+    // accumulator every exponentiation ladder starts from.
+    one: BigNat
+
+// The Montgomery context for an odd modulus.
+//
+// `BigEvenModulus` for an even one, and `BigZeroModulus` for zero.  The
+// requirement is not a limitation in practice: an RSA modulus is a
+// product of two odd primes, a curve's field prime is odd, and a group
+// order is odd — every modulus the crypto tier has.  A caller with an
+// even modulus uses `pow`, which divides and has no such requirement.
+//
+// ```novo
+// use bignum
+// use bigmod
+//
+// fn main() [io]
+//     match bignum.nat_from_int(11)
+//         Ok(n) =>
+//             match bigmod.montgomery(n)
+//                 Ok(m) => println("${m.limbs}")   // 1
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn montgomery(n: BigNat) -> Result<BigMont, BigFault> []
+    todo("bigint-nv.bigmod.montgomery")
+
+// A reduced value converted INTO Montgomery form: `a * R mod n`.
+//
+// One `mont_mul` against `r2`, which is what `r2` is for.
+pub fn to_mont(m: BigMont, a: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.to_mont")
+
+// A Montgomery-form value converted back: `a * R^-1 mod n`.
+//
+// One `mont_mul` against 1.
+pub fn from_mont(m: BigMont, a: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.from_mont")
+
+// The Montgomery product: `a * b * R^-1 mod n`, for two values already
+// in Montgomery form.
+//
+// Interleaved multiply-and-reduce (HAC § 14.36): one limb of the
+// product at a time, each followed by the reduction step that clears
+// the low limb, so no full-width intermediate is ever held.  The result
+// is in Montgomery form, which is what makes the form worth entering —
+// a chain of these never leaves it.
+//
+// VARIABLE TIME only in the conditional final subtraction, which every
+// textbook Montgomery multiplication has and which is a known leak of
+// one bit per operation.  `mont_pow_ct` is written so that subtraction
+// is performed unconditionally and its result selected, and that is the
+// difference between the two exponentiations.
+pub fn mont_mul(m: BigMont, a: BigNat, b: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.mont_mul")
+
+// The Montgomery square: `a * a * R^-1 mod n`.
+//
+// Beside `mont_mul` for the same reason `bignum.nat_sqr` is beside
+// `nat_mul` — an exponentiation squares once per bit and multiplies
+// only for the set ones, so this is the hot call and it has a cheaper
+// form.
+pub fn mont_sqr(m: BigMont, a: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.mont_sqr")
+
+// `base^exponent mod n`, through Montgomery form, with the conversions
+// at each end.
+//
+// The caller passes and receives ORDINARY reduced values: the entry
+// into Montgomery form and the exit are inside, because a caller who
+// had to do them would eventually do one of them twice.  A caller
+// already holding Montgomery-form values uses `mont_mul` and
+// `mont_sqr` directly.
+//
+// VARIABLE TIME in the exponent, like `pow`.
+pub fn mont_pow(m: BigMont, base: BigNat, exponent: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.mont_pow")
+
+// `base^exponent mod n` through Montgomery form, in CONSTANT TIME with
+// respect to the exponent.
+//
+// The fixed ladder of `pow_ct` over the Montgomery operations, with the
+// conditional final subtraction of `mont_mul` performed
+// unconditionally and selected.  This is the call an RSA private
+// operation and a scalar multiplication both want: the fastest
+// exponentiation this package has AND the one whose operation sequence
+// does not depend on the secret.
+//
+// `width` is the exponent's declared width in bits, for the reason
+// `pow_ct` gives.
+pub fn mont_pow_ct(m: BigMont, base: BigNat, exponent: BigNat,
+                   width: Int) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigmod.mont_pow_ct")

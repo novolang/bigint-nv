@@ -1,0 +1,141 @@
+// bigfault — every way an arbitrary-precision operation can refuse.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// ONE ENUM, BECAUSE THERE IS ONE AUDIENCE.  asn1-nv splits its refusals
+// into a decode error and an encode error because bytes that arrived
+// and a program that asked for something impossible are two different
+// faults with two different readers.  Nothing here arrives from a
+// network: a magnitude is built by the calling program out of an `Int`,
+// a text it chose, or bytes it already parsed.  So every refusal is the
+// caller's, one enum carries them all, and none of them has an offset
+// into anything except the text the caller passed in.
+//
+// WHY MOST OF THIS PACKAGE IS INFALLIBLE.  Addition, subtraction,
+// multiplication, comparison and shifting a magnitude left cannot fail:
+// the representation grows, and it grows until memory runs out, which
+// is a panic and not a value.  The fallible calls are the ones with a
+// precondition a caller can get wrong — a zero divisor, a text that is
+// not a number, a modulus with no inverse in it, a value too wide for a
+// fixed-width type — and they are few enough to list.  A signature that
+// returns a bare `BigNat` is a promise that it cannot refuse.
+
+// BigFault is why an arbitrary-precision operation would not answer.
+pub enum BigFault
+    // A division or a remainder by zero.  `what` names the call, so a
+    // caller with several in one expression knows which one.
+    BigDivideByZero(what: Str)
+    // A modular operation whose modulus was zero, or one where the
+    // modulus was 1 and the caller asked for a value the ring does not
+    // have.
+    BigZeroModulus(what: Str)
+    // `bigmod.inverse` found no inverse: the value and the modulus
+    // share a factor.  The factor itself is NOT carried here — this
+    // module names no type from `bignum`, so that `bignum` can name
+    // this one and the two do not import each other — and a caller who
+    // wants it asks `bigmod.gcd`, which is the same extended-Euclid
+    // walk run for its other answer.
+    BigNotInvertible
+    // A Montgomery context was asked for over an EVEN modulus.
+    // Montgomery reduction needs `R = 2^k` to be invertible modulo `n`,
+    // which requires `n` odd, and every modulus in the crypto tier —
+    // an RSA modulus, a curve's field prime, a group order — is.  A
+    // caller with an even modulus uses `bigmod.pow`, which has no such
+    // requirement.
+    BigEvenModulus
+    // A negative exponent where only a non-negative one has a meaning:
+    // `bignum.pow` over the integers, and `bigmod.pow` without an
+    // inverse to fall back on.
+    BigNegativeExponent
+    // A negative shift count.  `shl` and `shr` take the direction from
+    // the call rather than the sign of the count, so a negative one is
+    // a mistake rather than the other direction.
+    BigNegativeShift(by: Int)
+    // A radix outside 2 to 36 was passed to a text conversion.
+    BigBadRadix(radix: Int)
+    // Text that was empty, or that was a sign with no digits after it.
+    BigEmptyText
+    // A character in the text is not a digit in this radix.  `at` is
+    // the byte offset from the first character the caller passed, sign
+    // included, so two tools reading the same string name the same
+    // character.
+    BigBadDigit(at: Int, radix: Int)
+    // Text with a `_` separator in a place the grammar does not admit:
+    // leading, trailing, doubled, or between the sign and the first
+    // digit.  Separators inside a run of digits are fine and are
+    // exactly what makes a 2048-bit modulus readable.
+    BigBadSeparator(at: Int)
+    // A value did not fit a fixed-width type.  `bits` is how wide the
+    // value actually is and `width` is the type's, so the message can
+    // say "a 2056-bit value does not fit Big2048".
+    BigWidthExceeded(bits: Int, width: Int)
+    // A byte string offered to a fixed-width type was longer than the
+    // type holds, or was not the exact length a fixed-width decoder
+    // requires.  `len` is what arrived, `want` is what the type takes.
+    BigBadByteLength(len: Int, want: Int)
+    // A signed value where only a non-negative one has a meaning: the
+    // magnitude of a conversion, a modulus, a byte encoding that has no
+    // sign bit.
+    BigNegativeValue(what: Str)
+    // A value that a novo-lang `Int` cannot hold, from `to_int` or from
+    // a conversion that promised one.  `bits` is the value's width, and
+    // 64 is what an `Int` has — so this is the call to avoid rather
+    // than a fault in the number.
+    BigNotRepresentable(bits: Int)
+
+// message renders the refusal as one line of prose.
+//
+// `Result<_, BigFault>` requires this impl: SPEC § 3.4 admits a
+// `Result` error type only if it implements `Error`.
+impl Error for BigFault
+    // Answer the one-line report: what was wrong, and the numbers that
+    // make it actionable.
+    //
+    // ```novo
+    // use bigfault
+    //
+    // fn main() [io]
+    //     let e = BigBadRadix(radix: 64)
+    //     println(e.message())
+    //     // bigint: radix 64 is outside 2 to 36
+    // ```
+    fn message(self) -> Str
+        todo("bigint-nv.bigfault.BigFault.message")
+
+// Whether this refusal came from TEXT the caller passed rather than
+// from a number it built.
+//
+// The three text refusals — an empty string, a bad digit, a misplaced
+// separator — are the ones a program reading a configuration file wants
+// to report with the line it came from; everything else is a
+// programming mistake with no input to point at.  Named as a predicate
+// so a caller can ask rather than match three arms.
+//
+// ```novo
+// use bigfault
+//
+// fn main() [io]
+//     let a = bigfault.is_text_fault(BigBadDigit(at: 3, radix: 10))
+//     let b = bigfault.is_text_fault(BigEvenModulus)
+//     println("${a} ${b}")   // true false
+// ```
+pub fn is_text_fault(e: BigFault) -> Bool []
+    todo("bigint-nv.bigfault.is_text_fault")
+
+// The byte offset a text refusal stopped at, and `None` for every other
+// variant.
+//
+// An optional rather than a sentinel, because 0 is a real offset: a
+// string beginning with a `_` is `BigBadSeparator(at: 0)`.
+//
+// ```novo
+// use bigfault
+//
+// fn main() [io]
+//     match bigfault.text_offset(BigBadDigit(at: 3, radix: 10))
+//         Some(at) => println("${at}")   // 3
+//         None     => println("no offset")
+// ```
+pub fn text_offset(e: BigFault) -> ?Int []
+    todo("bigint-nv.bigfault.text_offset")

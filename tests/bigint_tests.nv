@@ -1,0 +1,914 @@
+// tests/bigint_tests.nv — the answers CPython and num-bigint give, and
+// the published constants the crypto tier is built on.
+//
+// They COMPILE today and they FAIL at run, with `not implemented:
+// bigint-nv.<module>.<fn>` from the `todo()` that is each body.  That is
+// the expected state of an interface release: the compiler has checked
+// every signature, every type and every effect row, and nothing else has
+// been checked because there is nothing else yet.
+//
+// WHERE THE VECTORS COME FROM.  Integer arithmetic has one answer, so
+// most of these are `python3 -c` and `num-bigint`'s own doctests written
+// down: `2^64`, `17 / 5`, `(-7) / 2` under both rounding rules, `3^-1
+// mod 11`.  The larger ones are published constants — P-256's field
+// prime and group order (FIPS 186-4 § D.1.2.3), which are the two
+// moduli every ECDSA implementation carries — and the shape of an
+// RSA-2048 modulus from RFC 8017.  There is NO TOLERANCE anywhere in
+// this file; that is the one thing that distinguishes a bignum suite
+// from every other numeric one, and it is why every assertion here is
+// an equality.
+
+use std.test
+use std.bytes
+use bignum
+use bigfmt
+use bigmod
+use bigfault
+use bigfix
+
+// ── the representation, which every other test rests on ─────────────
+
+@test
+fn test_a_limb_holds_twenty_eight_bits_and_the_mask_is_that_many_ones()
+    // The multiply is why: `(2^28 - 1)^2 + 2 * (2^28 - 1)` is under
+    // 2^56, so the inner step of a schoolbook multiply fits an `i64`
+    // whatever the operands' length.  At 32 bits it does not.
+    test.assert_eq(bignum.BIG_LIMB_BITS, 28)
+    test.assert_eq(bignum.BIG_LIMB_MASK, 268435455)
+    test.assert_eq(bignum.BIG_KARATSUBA_LIMBS, 32)
+
+@test
+fn test_zero_is_the_empty_limb_list_and_one_is_a_single_limb()
+    let z = bignum.nat_zero()
+    test.assert_eq(bignum.is_zero(z), true)
+    test.assert_eq(bignum.limb_count(z), 0)
+    test.assert_eq(bignum.bit_len(z), 0)
+    test.assert_eq(bignum.nat_limbs(z).len(), 0)
+    let o = bignum.nat_one()
+    test.assert_eq(bignum.is_zero(o), false)
+    test.assert_eq(bignum.limb_count(o), 1)
+    test.assert_eq(bignum.bit_len(o), 1)
+    test.assert_eq(bignum.is_odd(o), true)
+    test.assert_eq(bignum.nat_bit(o, 0), true)
+    test.assert_eq(bignum.nat_bit(o, 9999), false)
+
+@test
+fn test_a_value_at_the_limb_boundary_takes_a_second_limb()
+    // 2^28 is the first number that does not fit one limb.
+    match bignum.nat_from_int(268435455)
+        Ok(a)  => test.assert_eq(bignum.limb_count(a), 1)
+        Err(e) => test.fail(e.message())
+    match bignum.nat_from_int(268435456)
+        Ok(a)  =>
+            test.assert_eq(bignum.limb_count(a), 2)
+            test.assert_eq(bignum.bit_len(a), 29)
+            test.assert_eq(bignum.nat_trailing_zeros(a), 28)
+            test.assert_eq(bignum.nat_popcount(a), 1)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_magnitude_refuses_a_negative_int_rather_than_taking_its_absolute_value()
+    // Silently absorbing the sign would make `nat_from_int(-1)` and
+    // `nat_from_int(1)` the same value, which hides a sign error for a
+    // year.
+    match bignum.nat_from_int(-1)
+        Ok(_)  => test.fail("a magnitude has no sign to carry")
+        Err(e) =>
+            match e
+                BigNegativeValue(_) => test.assert_eq(true, true)
+                _                   => test.fail("expected BigNegativeValue: ${e.message()}")
+
+@test
+fn test_limbs_a_caller_assembled_are_canonicalised_on_the_way_in()
+    // A leading zero limb is dropped and an over-wide limb is carried,
+    // so a hand-built value compares equal to the same number built any
+    // other way.
+    let a = bignum.nat_from_limbs([1, 0, 0])
+    test.assert_eq(bignum.limb_count(a), 1)
+    let b = bignum.nat_from_limbs([268435456])
+    test.assert_eq(bignum.limb_count(b), 2)
+    test.assert_eq(bignum.nat_eq(a, bignum.nat_one()), true)
+
+@test
+fn test_a_magnitude_is_an_int_only_while_it_fits_sixty_three_bits()
+    match bignum.nat_from_int(42)
+        Ok(a)  =>
+            match bignum.nat_to_int(a)
+                Ok(v)  => test.assert_eq(v, 42)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // 2^64 needs 65 bits and an `Int` has 63 to spend.
+    match bigfmt.nat_parse_decimal("18446744073709551616")
+        Ok(big) =>
+            test.assert_eq(bignum.bit_len(big), 65)
+            match bignum.nat_to_int(big)
+                Ok(_)  => test.fail("2^64 does not fit an Int")
+                Err(e) =>
+                    match e
+                        BigNotRepresentable(bits) => test.assert_eq(bits, 65)
+                        _                         => test.fail("expected BigNotRepresentable: ${e.message()}")
+        Err(e)  => test.fail(e.message())
+
+// ── magnitude arithmetic, against CPython's answers ─────────────────
+
+@test
+fn test_addition_and_comparison_over_magnitudes()
+    match bignum.nat_from_int(255)
+        Ok(a)  =>
+            match bignum.nat_from_int(1)
+                Ok(b)  =>
+                    let s = bignum.nat_add(a, b)
+                    test.assert_eq(bignum.bit_len(s), 9)
+                    test.assert_eq(bignum.nat_cmp(s, a), 1)
+                    test.assert_eq(bignum.nat_cmp(a, s), -1)
+                    test.assert_eq(bignum.nat_cmp(a, a), 0)
+                    test.assert_eq(bignum.nat_eq(a, a), true)
+                    test.assert_eq(bignum.nat_eq(a, s), false)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_subtracting_the_larger_magnitude_refuses_rather_than_wrapping()
+    match bignum.nat_from_int(1)
+        Ok(one) =>
+            match bignum.nat_from_int(2)
+                Ok(two) =>
+                    match bignum.nat_sub(two, one)
+                        Ok(d)  => test.assert_eq(bignum.nat_eq(d, one), true)
+                        Err(e) => test.fail(e.message())
+                    match bignum.nat_sub(one, two)
+                        Ok(_)  => test.fail("a magnitude has nowhere to put a sign")
+                        Err(e) =>
+                            match e
+                                BigNegativeValue(_) => test.assert_eq(true, true)
+                                _                   => test.fail("expected BigNegativeValue: ${e.message()}")
+                Err(e)  => test.fail(e.message())
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_the_two_multiplications_agree_across_the_karatsuba_threshold()
+    // 2^1000 * 2^1000 is 2^2000, and the operands are 36 limbs — above
+    // `BIG_KARATSUBA_LIMBS`, so this pair goes through the recursive
+    // path.  The threshold is a speed decision and never a correctness
+    // one, which is what this asserts.
+    match bignum.nat_from_int(2)
+        Ok(two) =>
+            match bignum.nat_pow(two, 1000)
+                Ok(big) =>
+                    test.assert_eq(bignum.bit_len(big), 1001)
+                    let p = bignum.nat_mul(big, big)
+                    test.assert_eq(bignum.bit_len(p), 2001)
+                    let q = bignum.nat_sqr(big)
+                    test.assert_eq(bignum.nat_eq(p, q), true)
+                Err(e)  => test.fail(e.message())
+            // And the same pair below the threshold.
+            match bignum.nat_pow(two, 40)
+                Ok(small) =>
+                    test.assert_eq(bignum.nat_eq(bignum.nat_mul(small, small),
+                                                 bignum.nat_sqr(small)),
+                                                 true)
+                Err(e)    => test.fail(e.message())
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_division_answers_a_quotient_and_a_euclidean_remainder_together()
+    // 17 = 3 * 5 + 2, and the remainder is in `0 ..= 4` always.
+    match bigfmt.nat_parse_decimal("17")
+        Ok(a)  =>
+            match bigfmt.nat_parse_decimal("5")
+                Ok(b)  =>
+                    match bignum.nat_divmod(a, b)
+                        Ok(qr) =>
+                            test.assert_eq(bigfmt.nat_to_decimal(qr.quotient), "3")
+                            test.assert_eq(bigfmt.nat_to_decimal(qr.remainder), "2")
+                        Err(e) => test.fail(e.message())
+                    match bignum.nat_div(a, b)
+                        Ok(q)  => test.assert_eq(bigfmt.nat_to_decimal(q), "3")
+                        Err(e) => test.fail(e.message())
+                    match bignum.nat_rem(a, b)
+                        Ok(r)  => test.assert_eq(bigfmt.nat_to_decimal(r), "2")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_dividing_by_zero_is_the_one_thing_division_refuses()
+    match bigfmt.nat_parse_decimal("1")
+        Ok(a)  =>
+            match bignum.nat_divmod(a, bignum.nat_zero())
+                Ok(_)  => test.fail("nothing divides by zero")
+                Err(e) =>
+                    match e
+                        BigDivideByZero(_) => test.assert_eq(true, true)
+                        _                  => test.fail("expected BigDivideByZero: ${e.message()}")
+            match bignum.nat_div(a, bignum.nat_zero())
+                Ok(_)  => test.fail("nothing divides by zero")
+                Err(_) => test.assert_eq(true, true)
+            match bignum.nat_rem(a, bignum.nat_zero())
+                Ok(_)  => test.fail("nothing divides by zero")
+                Err(_) => test.assert_eq(true, true)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_gcd_of_two_fibonacci_neighbours_is_one_which_is_euclids_worst_case()
+    // Consecutive Fibonacci numbers are the pair that makes Euclid take
+    // the most steps, so they are the standard GCD stress vector.
+    match bigfmt.nat_parse_decimal("6765")
+        Ok(a)  =>
+            match bigfmt.nat_parse_decimal("4181")
+                Ok(b)  =>
+                    test.assert_eq(bigfmt.nat_to_decimal(bignum.nat_gcd(a, b)), "1")
+                Err(e) => test.fail(e.message())
+            test.assert_eq(bigfmt.nat_to_decimal(bignum.nat_gcd(a, bignum.nat_zero())),
+                           "6765")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_shift_is_a_multiplication_and_a_division_by_a_power_of_two()
+    match bignum.nat_from_int(1)
+        Ok(one) =>
+            match bignum.nat_shl(one, 100)
+                Ok(x)  =>
+                    test.assert_eq(bignum.bit_len(x), 101)
+                    test.assert_eq(bignum.nat_trailing_zeros(x), 100)
+                    match bignum.nat_shr(x, 100)
+                        Ok(back) => test.assert_eq(bignum.nat_eq(back, one), true)
+                        Err(e)   => test.fail(e.message())
+                    // Past the top: zero, not a refusal.  That is what
+                    // lets an exponent loop terminate without a bound
+                    // test of its own.
+                    match bignum.nat_shr(x, 1000)
+                        Ok(gone) => test.assert_eq(bignum.is_zero(gone), true)
+                        Err(e)   => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match bignum.nat_shl(one, -1)
+                Ok(_)  => test.fail("a shift takes its direction from the call")
+                Err(e) =>
+                    match e
+                        BigNegativeShift(by) => test.assert_eq(by, -1)
+                        _                    => test.fail("expected BigNegativeShift: ${e.message()}")
+            match bignum.nat_shr(one, -1)
+                Ok(_)  => test.fail("a shift takes its direction from the call")
+                Err(_) => test.assert_eq(true, true)
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_the_magnitude_bitwise_operations_are_limbwise()
+    match bignum.nat_from_int(12)
+        Ok(a)  =>
+            match bignum.nat_from_int(10)
+                Ok(b)  =>
+                    // 0b1100 & 0b1010 == 0b1000, | == 0b1110, ^ == 0b0110
+                    test.assert_eq(bigfmt.nat_to_decimal(bignum.nat_bit_and(a, b)), "8")
+                    test.assert_eq(bigfmt.nat_to_decimal(bignum.nat_bit_or(a, b)), "14")
+                    test.assert_eq(bigfmt.nat_to_decimal(bignum.nat_bit_xor(a, b)), "6")
+                    test.assert_eq(bignum.nat_popcount(a), 2)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_raising_to_a_negative_power_refuses_rather_than_returning_a_rational()
+    match bignum.nat_from_int(2)
+        Ok(two) =>
+            match bignum.nat_pow(two, -1)
+                Ok(_)  => test.fail("the integers are not closed under that")
+                Err(e) =>
+                    match e
+                        BigNegativeExponent => test.assert_eq(true, true)
+                        _                   => test.fail("expected BigNegativeExponent: ${e.message()}")
+            match bignum.nat_pow(two, 0)
+                Ok(one) => test.assert_eq(bigfmt.nat_to_decimal(one), "1")
+                Err(e)  => test.fail(e.message())
+        Err(e)  => test.fail(e.message())
+
+// ── the signed number, and the two rounding rules ──────────────────
+
+@test
+fn test_a_signed_number_has_one_zero_and_no_negative_one()
+    test.assert_eq(bignum.sign(bignum.zero()), 0)
+    test.assert_eq(bignum.sign(bignum.one()), 1)
+    test.assert_eq(bignum.sign(bignum.from_int(-7)), -1)
+    test.assert_eq(bignum.sign(bignum.neg(bignum.zero())), 0)
+    // Asking for a negative zero gives a zero.
+    test.assert_eq(bignum.sign(bignum.of_sign_mag(-1, bignum.nat_zero())), 0)
+    test.assert_eq(bignum.eq(bignum.from_int(0), bignum.zero()), true)
+
+@test
+fn test_signed_addition_subtraction_and_multiplication_carry_the_sign()
+    let a = bignum.from_int(-7)
+    let b = bignum.from_int(2)
+    test.assert_eq(bigfmt.to_decimal(bignum.add(a, b)), "-5")
+    test.assert_eq(bigfmt.to_decimal(bignum.sub(a, b)), "-9")
+    test.assert_eq(bigfmt.to_decimal(bignum.mul(a, b)), "-14")
+    test.assert_eq(bigfmt.to_decimal(bignum.abs(a)), "7")
+    test.assert_eq(bigfmt.to_decimal(bignum.neg(a)), "7")
+    test.assert_eq(bignum.cmp(a, b), -1)
+    test.assert_eq(bignum.cmp(b, a), 1)
+    test.assert_eq(bignum.cmp(a, a), 0)
+    // The magnitude drops the sign, which is what makes it a magnitude.
+    test.assert_eq(bigfmt.nat_to_decimal(bignum.magnitude(a)), "7")
+
+@test
+fn test_truncated_and_floored_division_disagree_and_both_are_published()
+    // CPython: -7 // 2 == -4, -7 % 2 == 1.
+    // Rust and num-bigint: -7 / 2 == -3, -7 % 2 == -1.
+    // Both are correct.  A package that picked one silently would be a
+    // trap, so both are here under names that say which.
+    let a = bignum.from_int(-7)
+    let b = bignum.from_int(2)
+    match bignum.divmod(a, b)
+        Ok(t)  =>
+            test.assert_eq(bigfmt.to_decimal(t.quotient), "-3")
+            test.assert_eq(bigfmt.to_decimal(t.remainder), "-1")
+        Err(e) => test.fail(e.message())
+    match bignum.floordivmod(a, b)
+        Ok(f)  =>
+            test.assert_eq(bigfmt.to_decimal(f.quotient), "-4")
+            test.assert_eq(bigfmt.to_decimal(f.remainder), "1")
+        Err(e) => test.fail(e.message())
+    match bignum.divmod(a, bignum.zero())
+        Ok(_)  => test.fail("nothing divides by zero")
+        Err(_) => test.assert_eq(true, true)
+    match bignum.floordivmod(a, bignum.zero())
+        Ok(_)  => test.fail("nothing divides by zero")
+        Err(_) => test.assert_eq(true, true)
+
+@test
+fn test_signed_power_and_the_int_round_trip()
+    match bignum.pow(bignum.from_int(-2), 3)
+        Ok(v)  => test.assert_eq(bigfmt.to_decimal(v), "-8")
+        Err(e) => test.fail(e.message())
+    match bignum.pow(bignum.from_int(2), -1)
+        Ok(_)  => test.fail("the integers are not closed under that")
+        Err(_) => test.assert_eq(true, true)
+    match bignum.to_int(bignum.from_int(-9223372036854775807))
+        Ok(v)  => test.assert_eq(v, -9223372036854775807)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_signed_bitwise_operations_read_an_infinite_run_of_sign_bits()
+    // CPython: -1 & 5 == 5, -2 | 1 == -1, -1 ^ 0 == -1, ~5 == -6.
+    // Sign-and-magnitude has no sign bits to hand, so the rule is
+    // stated rather than derived — and a package that quietly did
+    // something else here would pass every test of small positive
+    // numbers.
+    let minus_one = bignum.from_int(-1)
+    let five = bignum.from_int(5)
+    test.assert_eq(bigfmt.to_decimal(bignum.bit_and(minus_one, five)), "5")
+    test.assert_eq(bigfmt.to_decimal(bignum.bit_or(bignum.from_int(-2),
+                                                   bignum.one())),
+                                                   "-1")
+    test.assert_eq(bigfmt.to_decimal(bignum.bit_xor(minus_one, bignum.zero())), "-1")
+    test.assert_eq(bigfmt.to_decimal(bignum.bit_not(five)), "-6")
+
+@test
+fn test_a_signed_right_shift_floors_so_minus_one_stays_minus_one()
+    // CPython: -1 >> 10 == -1.  An implementation that shifted the
+    // magnitude and reapplied the sign would answer 0, and would then
+    // disagree with dividing by two for every negative number.
+    match bignum.shr(bignum.from_int(-1), 10)
+        Ok(v)  => test.assert_eq(bigfmt.to_decimal(v), "-1")
+        Err(e) => test.fail(e.message())
+    match bignum.shr(bignum.from_int(-7), 1)
+        Ok(v)  => test.assert_eq(bigfmt.to_decimal(v), "-4")
+        Err(e) => test.fail(e.message())
+    match bignum.shl(bignum.from_int(-1), 4)
+        Ok(v)  => test.assert_eq(bigfmt.to_decimal(v), "-16")
+        Err(e) => test.fail(e.message())
+    match bignum.shl(bignum.one(), -1)
+        Ok(_)  => test.fail("a shift takes its direction from the call")
+        Err(_) => test.assert_eq(true, true)
+
+// ── text ────────────────────────────────────────────────────────────
+
+@test
+fn test_powers_of_two_render_the_digits_everybody_knows()
+    match bigfmt.nat_parse_decimal("18446744073709551616")
+        Ok(a)  =>
+            test.assert_eq(bigfmt.nat_to_decimal(a), "18446744073709551616")
+            test.assert_eq(bigfmt.nat_to_hex(a), "10000000000000000")
+            match bigfmt.nat_to_radix(a, 16)
+                Ok(h)  => test.assert_eq(h, "10000000000000000")
+                Err(e) => test.fail(e.message())
+            match bigfmt.nat_to_hex_padded(a, 20)
+                Ok(h)  => test.assert_eq(h, "00010000000000000000")
+                Err(e) => test.fail(e.message())
+            match bigfmt.nat_to_hex_padded(a, 2)
+                Ok(_)  => test.fail("2^64 does not fit two hex digits")
+                Err(e) =>
+                    match e
+                        BigWidthExceeded(bits, width) =>
+                            test.assert_eq(bits, 65)
+                            test.assert_eq(width, 8)
+                        _                             => test.fail("expected BigWidthExceeded: ${e.message()}")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_zero_renders_as_one_digit_in_every_radix()
+    let z = bignum.nat_zero()
+    test.assert_eq(bigfmt.nat_to_decimal(z), "0")
+    test.assert_eq(bigfmt.nat_to_hex(z), "0")
+    test.assert_eq(bigfmt.to_decimal(bignum.zero()), "0")
+    match bigfmt.nat_to_radix(z, 2)
+        Ok(s)  => test.assert_eq(s, "0")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_radix_outside_two_to_thirty_six_is_refused_in_both_directions()
+    match bigfmt.nat_to_radix(bignum.nat_one(), 1)
+        Ok(_)  => test.fail("base 1 is not a positional system")
+        Err(e) =>
+            match e
+                BigBadRadix(r) => test.assert_eq(r, 1)
+                _              => test.fail("expected BigBadRadix: ${e.message()}")
+    match bigfmt.nat_parse_radix("zz", 37)
+        Ok(_)  => test.fail("36 digits is all the alphabet has")
+        Err(_) => test.assert_eq(true, true)
+    match bigfmt.to_radix(bignum.one(), 64)
+        Ok(_)  => test.fail("base 64 here is not base64")
+        Err(_) => test.assert_eq(true, true)
+    match bigfmt.parse_radix("ff", 16)
+        Ok(v)  => test.assert_eq(bigfmt.to_decimal(v), "255")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_separators_are_accepted_between_digits_and_nowhere_else()
+    // A 617-digit RSA modulus in a source file is unreadable without
+    // them, and a leading one is a mistake worth naming.
+    match bigfmt.nat_parse_decimal("1_000_000")
+        Ok(a)  => test.assert_eq(bigfmt.nat_to_decimal(a), "1000000")
+        Err(e) => test.fail(e.message())
+    match bigfmt.nat_parse_decimal("_1")
+        Ok(_)  => test.fail("a separator leads nothing")
+        Err(e) =>
+            match e
+                BigBadSeparator(at) => test.assert_eq(at, 0)
+                _                   => test.fail("expected BigBadSeparator: ${e.message()}")
+    match bigfmt.nat_parse_decimal("1__0")
+        Ok(_)  => test.fail("two separators separate nothing")
+        Err(_) => test.assert_eq(true, true)
+    match bigfmt.parse("-_1")
+        Ok(_)  => test.fail("a separator after a sign separates nothing")
+        Err(_) => test.assert_eq(true, true)
+
+@test
+fn test_a_bad_digit_names_its_offset_and_an_empty_string_is_not_a_number()
+    match bigfmt.nat_parse_decimal("12x4")
+        Ok(_)  => test.fail("x is not a decimal digit")
+        Err(e) =>
+            match e
+                BigBadDigit(at, radix) =>
+                    test.assert_eq(at, 2)
+                    test.assert_eq(radix, 10)
+                _                      => test.fail("expected BigBadDigit: ${e.message()}")
+            test.assert_eq(bigfault.is_text_fault(e), true)
+            match bigfault.text_offset(e)
+                Some(at) => test.assert_eq(at, 2)
+                None     => test.fail("a text fault has an offset")
+    match bigfmt.nat_parse_decimal("")
+        Ok(_)  => test.fail("the empty string is not a number")
+        Err(e) =>
+            match e
+                BigEmptyText => test.assert_eq(true, true)
+                _            => test.fail("expected BigEmptyText: ${e.message()}")
+    match bigfmt.parse("-")
+        Ok(_)  => test.fail("a sign with no digits is not a number")
+        Err(_) => test.assert_eq(true, true)
+    // Every other refusal has no offset to give.
+    test.assert_eq(bigfault.is_text_fault(BigEvenModulus), false)
+    match bigfault.text_offset(BigEvenModulus)
+        Some(_) => test.fail("nothing arrived, so there is nothing to point at")
+        None    => test.assert_eq(true, true)
+
+@test
+fn test_hexadecimal_parses_in_either_case_and_renders_in_lower()
+    match bigfmt.nat_parse_hex("DEADbeef")
+        Ok(a)  =>
+            test.assert_eq(bigfmt.nat_to_hex(a), "deadbeef")
+            test.assert_eq(bigfmt.nat_to_decimal(a), "3735928559")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_signed_text_direction_carries_a_minus_and_never_a_plus()
+    match bigfmt.parse("-1_000")
+        Ok(n)  =>
+            test.assert_eq(bigfmt.to_decimal(n), "-1000")
+            test.assert_eq(bignum.sign(n), -1)
+        Err(e) => test.fail(e.message())
+    match bigfmt.parse("+42")
+        Ok(n)  => test.assert_eq(bigfmt.to_decimal(n), "42")
+        Err(e) => test.fail(e.message())
+    match bigfmt.to_radix(bignum.from_int(-255), 16)
+        Ok(s)  => test.assert_eq(s, "-ff")
+        Err(e) => test.fail(e.message())
+
+// ── bytes ───────────────────────────────────────────────────────────
+
+@test
+fn test_big_endian_bytes_round_trip_and_zero_encodes_to_nothing()
+    let b = bytes.from_byte_list([1, 0])
+    let a = bigfmt.nat_from_be_bytes(b)
+    test.assert_eq(bigfmt.nat_to_decimal(a), "256")
+    test.assert_eq(bigfmt.nat_byte_len(a), 2)
+    test.assert_eq(bytes.len(bigfmt.nat_to_be_bytes(a)), 2)
+    // Zero is the EMPTY string, because that is what makes the round
+    // trip a round trip: `from_be_bytes` of an empty input is zero.
+    let z = bigfmt.nat_from_be_bytes(bytes.from_byte_list([]))
+    test.assert_eq(bignum.is_zero(z), true)
+    test.assert_eq(bytes.len(bigfmt.nat_to_be_bytes(bignum.nat_zero())), 0)
+    test.assert_eq(bigfmt.nat_byte_len(bignum.nat_zero()), 0)
+    // Leading zeros on the way in are accepted and dropped.
+    let padded = bigfmt.nat_from_be_bytes(bytes.from_byte_list([0, 0, 1]))
+    test.assert_eq(bigfmt.nat_to_decimal(padded), "1")
+
+@test
+fn test_the_padded_encoding_is_what_every_signature_format_requires()
+    // RFC 8017 § 4.1: an RSA signature is as many bytes as the modulus.
+    // A leading zero that got stripped is a signature that verifies
+    // nowhere, which is why the padded call exists beside the shortest
+    // one rather than as a flag on it.
+    match bignum.nat_from_int(1)
+        Ok(one) =>
+            match bigfmt.nat_to_be_bytes_padded(one, 32)
+                Ok(b)  =>
+                    test.assert_eq(bytes.len(b), 32)
+                    match bytes.byte_at(b, 0)
+                        Some(v) => test.assert_eq(v, 0)
+                        None    => test.fail("32 bytes has a byte 0")
+                    match bytes.byte_at(b, 31)
+                        Some(v) => test.assert_eq(v, 1)
+                        None    => test.fail("32 bytes has a byte 31")
+                Err(e) => test.fail(e.message())
+            match bigfmt.nat_to_be_bytes_padded(one, 0)
+                Ok(_)  => test.fail("1 does not fit zero bytes")
+                Err(e) =>
+                    match e
+                        BigBadByteLength(len, want) =>
+                            test.assert_eq(len, 1)
+                            test.assert_eq(want, 0)
+                        _                           => test.fail("expected BigBadByteLength: ${e.message()}")
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_a_signed_value_carries_its_sign_beside_the_bytes_and_not_in_them()
+    // Half of all 2048-bit moduli have a leading byte above 0x7f, and a
+    // decoder that read that as a sign would misread every one of them.
+    let b = bytes.from_byte_list([255])
+    let n = bigfmt.from_sign_be_bytes(-1, b)
+    test.assert_eq(bignum.sign(n), -1)
+    test.assert_eq(bigfmt.to_decimal(n), "-255")
+    test.assert_eq(bytes.len(bigfmt.to_be_bytes(n)), 1)
+    let p = bigfmt.from_sign_be_bytes(1, b)
+    test.assert_eq(bigfmt.to_decimal(p), "255")
+
+// ── modular arithmetic ──────────────────────────────────────────────
+
+@test
+fn test_reduction_and_the_ring_operations_over_a_small_modulus()
+    match bigfmt.nat_parse_decimal("7")
+        Ok(n)  =>
+            match bigfmt.nat_parse_decimal("17")
+                Ok(a)  =>
+                    match bigmod.reduce(a, n)
+                        Ok(r)  => test.assert_eq(bigfmt.nat_to_decimal(r), "3")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            match bigfmt.nat_parse_decimal("5")
+                Ok(five) =>
+                    match bigmod.add(five, five, n)
+                        Ok(r)  => test.assert_eq(bigfmt.nat_to_decimal(r), "3")
+                        Err(e) => test.fail(e.message())
+                    match bigmod.sub(bignum.nat_one(), five, n)
+                        Ok(r)  => test.assert_eq(bigfmt.nat_to_decimal(r), "3")
+                        Err(e) => test.fail(e.message())
+                    match bigmod.mul(five, five, n)
+                        Ok(r)  => test.assert_eq(bigfmt.nat_to_decimal(r), "4")
+                        Err(e) => test.fail(e.message())
+                    match bigmod.sqr(five, n)
+                        Ok(r)  => test.assert_eq(bigfmt.nat_to_decimal(r), "4")
+                        Err(e) => test.fail(e.message())
+                    match bigmod.neg(five, n)
+                        Ok(r)  => test.assert_eq(bigfmt.nat_to_decimal(r), "2")
+                        Err(e) => test.fail(e.message())
+                Err(e)   => test.fail(e.message())
+            // A signed value reduces into `0 ..= n - 1`, which is the
+            // FLOORED remainder: -1 mod 7 is 6 and not -1.
+            match bigmod.of_num(bignum.from_int(-1), n)
+                Ok(r)  => test.assert_eq(bigfmt.nat_to_decimal(r), "6")
+                Err(e) => test.fail(e.message())
+            match bigmod.reduce(bignum.nat_one(), bignum.nat_zero())
+                Ok(_)  => test.fail("there is no ring modulo zero")
+                Err(e) =>
+                    match e
+                        BigZeroModulus(_) => test.assert_eq(true, true)
+                        _                 => test.fail("expected BigZeroModulus: ${e.message()}")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_modular_exponentiation_agrees_between_the_plain_and_constant_time_forms()
+    // 3^100 mod 7 == 4 (CPython: pow(3, 100, 7)).  The two forms differ
+    // in what they leak and in nothing else, which is what this asserts.
+    match bigfmt.nat_parse_decimal("3")
+        Ok(base) =>
+            match bigfmt.nat_parse_decimal("100")
+                Ok(e100) =>
+                    match bigfmt.nat_parse_decimal("7")
+                        Ok(n)   =>
+                            match bigmod.pow(base, e100, n)
+                                Ok(r)   => test.assert_eq(bigfmt.nat_to_decimal(r), "4")
+                                Err(er) => test.fail(er.message())
+                            match bigmod.pow_ct(base, e100, 7, n)
+                                Ok(r)   => test.assert_eq(bigfmt.nat_to_decimal(r), "4")
+                                Err(er) => test.fail(er.message())
+                            // The declared width is the ladder's length,
+                            // and a value wider than it is the caller's
+                            // mistake rather than something to absorb.
+                            match bigmod.pow_ct(base, e100, 3, n)
+                                Ok(_)   => test.fail("100 does not fit three bits")
+                                Err(er) =>
+                                    match er
+                                        BigWidthExceeded(_, _) => test.assert_eq(true, true)
+                                        _                      => test.fail("expected BigWidthExceeded: ${er.message()}")
+                        Err(er) => test.fail(er.message())
+                Err(er)  => test.fail(er.message())
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_the_modular_inverse_and_what_it_says_when_there_is_none()
+    // 3 * 4 == 12 == 1 (mod 11).
+    match bigfmt.nat_parse_decimal("3")
+        Ok(a)  =>
+            match bigfmt.nat_parse_decimal("11")
+                Ok(p)  =>
+                    match bigmod.inverse(a, p)
+                        Ok(x)  => test.assert_eq(bigfmt.nat_to_decimal(x), "4")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // 2 and 4 share a factor, so there is no inverse — and in a
+            // key generator that is a fact worth having rather than a
+            // failure.  The factor itself comes from `gcd`.
+            match bigfmt.nat_parse_decimal("4")
+                Ok(four) =>
+                    match bigfmt.nat_parse_decimal("2")
+                        Ok(two) =>
+                            match bigmod.inverse(two, four)
+                                Ok(_)  => test.fail("2 and 4 share a factor")
+                                Err(e) =>
+                                    match e
+                                        BigNotInvertible => test.assert_eq(true, true)
+                                        _                => test.fail("expected BigNotInvertible: ${e.message()}")
+                            test.assert_eq(bigfmt.nat_to_decimal(bigmod.gcd(two, four)), "2")
+                        Err(e)  => test.fail(e.message())
+                Err(e)   => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_montgomery_context_is_built_once_and_refuses_an_even_modulus()
+    // R must be invertible modulo n, which needs n odd — and every
+    // modulus the crypto tier has is: an RSA modulus is a product of
+    // two odd primes, a field prime is odd, a group order is odd.
+    match bigfmt.nat_parse_decimal("11")
+        Ok(n)  =>
+            match bigmod.montgomery(n)
+                Ok(m)  =>
+                    test.assert_eq(m.limbs, 1)
+                    test.assert_eq(bignum.nat_eq(m.modulus, n), true)
+                    // R mod n is Montgomery form's 1, and converting it
+                    // back gives an ordinary 1.
+                    match bigmod.from_mont(m, m.one)
+                        Ok(one) => test.assert_eq(bigfmt.nat_to_decimal(one), "1")
+                        Err(e)  => test.fail(e.message())
+                    match bigfmt.nat_parse_decimal("5")
+                        Ok(five) =>
+                            match bigmod.to_mont(m, five)
+                                Ok(f)  =>
+                                    match bigmod.from_mont(m, f)
+                                        Ok(back) =>
+                                            test.assert_eq(bigfmt.nat_to_decimal(back), "5")
+                                        Err(e)   => test.fail(e.message())
+                                    match bigmod.mont_mul(m, f, f)
+                                        Ok(sq) =>
+                                            match bigmod.from_mont(m, sq)
+                                                Ok(v)  => test.assert_eq(bigfmt.nat_to_decimal(v), "3")
+                                                Err(e) => test.fail(e.message())
+                                        Err(e) => test.fail(e.message())
+                                    match bigmod.mont_sqr(m, f)
+                                        Ok(sq) =>
+                                            match bigmod.from_mont(m, sq)
+                                                Ok(v)  => test.assert_eq(bigfmt.nat_to_decimal(v), "3")
+                                                Err(e) => test.fail(e.message())
+                                        Err(e) => test.fail(e.message())
+                                Err(e) => test.fail(e.message())
+                        Err(e)   => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+            // The `r2` field is what converts a value in with one
+            // multiplication, and a reader checking this against HAC
+            // § 14.36 needs to see it.
+            match bigmod.montgomery(n)
+                Ok(m)  => test.assert_eq(bignum.is_zero(m.r2), false)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    match bigfmt.nat_parse_decimal("10")
+        Ok(even) =>
+            match bigmod.montgomery(even)
+                Ok(_)  => test.fail("Montgomery reduction needs an odd modulus")
+                Err(e) =>
+                    match e
+                        BigEvenModulus => test.assert_eq(true, true)
+                        _              => test.fail("expected BigEvenModulus: ${e.message()}")
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_montgomery_exponentiation_answers_what_plain_exponentiation_does()
+    // The P-256 field prime, FIPS 186-4 § D.1.2.3 — the modulus every
+    // ECDSA implementation on that curve carries, and one this package
+    // must handle at full width.
+    match bigfmt.nat_parse_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+        Ok(p)  =>
+            test.assert_eq(bignum.bit_len(p), 256)
+            test.assert_eq(bignum.is_odd(p), true)
+            match bigmod.montgomery(p)
+                Ok(m)  =>
+                    test.assert_eq(m.limbs, 10)
+                    match bigfmt.nat_parse_decimal("2")
+                        Ok(two) =>
+                            match bigfmt.nat_parse_decimal("65537")
+                                Ok(e)   =>
+                                    match bigmod.mont_pow(m, two, e)
+                                        Ok(a)   =>
+                                            match bigmod.pow(two, e, p)
+                                                Ok(b)   => test.assert_eq(bignum.nat_eq(a, b), true)
+                                                Err(er) => test.fail(er.message())
+                                        Err(er) => test.fail(er.message())
+                                    match bigmod.mont_pow_ct(m, two, e, 17)
+                                        Ok(a)   =>
+                                            match bigmod.pow_ct(two, e, 17, p)
+                                                Ok(b)   => test.assert_eq(bignum.nat_eq(a, b), true)
+                                                Err(er) => test.fail(er.message())
+                                        Err(er) => test.fail(er.message())
+                                Err(er) => test.fail(er.message())
+                        Err(er) => test.fail(er.message())
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_constant_time_primitives_read_both_arms()
+    match bigfmt.nat_parse_decimal("7")
+        Ok(a)  =>
+            match bigfmt.nat_parse_decimal("9")
+                Ok(b)  =>
+                    match bigmod.select_ct(a, b, 0)
+                        Ok(v)  => test.assert_eq(bigfmt.nat_to_decimal(v), "7")
+                        Err(e) => test.fail(e.message())
+                    match bigmod.select_ct(a, b, 1)
+                        Ok(v)  => test.assert_eq(bigfmt.nat_to_decimal(v), "9")
+                        Err(e) => test.fail(e.message())
+                    test.assert_eq(bigmod.eq_ct(a, a), true)
+                    test.assert_eq(bigmod.eq_ct(a, b), false)
+                Err(e) => test.fail(e.message())
+            // Selecting between values of different lengths would leak
+            // the length, which is the one thing the caller is hiding.
+            match bigfmt.nat_parse_decimal("18446744073709551616")
+                Ok(wide) =>
+                    match bigmod.select_ct(a, wide, 0)
+                        Ok(_)  => test.fail("a select between unequal lengths leaks one")
+                        Err(e) =>
+                            match e
+                                BigWidthExceeded(_, _) => test.assert_eq(true, true)
+                                _                      => test.fail("expected BigWidthExceeded: ${e.message()}")
+                Err(e)   => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+// ── the fixed widths ────────────────────────────────────────────────
+
+@test
+fn test_the_limb_counts_are_what_twenty_eight_bit_limbs_cost_at_each_width()
+    test.assert_eq(bigfix.BIG256_BITS, 256)
+    test.assert_eq(bigfix.BIG256_LIMBS, 10)
+    test.assert_eq(bigfix.BIG256_BYTES, 32)
+    test.assert_eq(bigfix.BIG2048_BITS, 2048)
+    test.assert_eq(bigfix.BIG2048_LIMBS, 74)
+    test.assert_eq(bigfix.BIG2048_BYTES, 256)
+    test.assert_eq(bigfix.BIG4096_BITS, 4096)
+    test.assert_eq(bigfix.BIG4096_LIMBS, 147)
+    test.assert_eq(bigfix.BIG4096_BYTES, 512)
+
+@test
+fn test_a_fixed_width_value_is_checked_once_where_it_is_constructed()
+    // The P-256 group order, FIPS 186-4 § D.1.2.3: 256 bits exactly, so
+    // it fits `Big256` and nothing downstream has to check again.
+    match bigfmt.nat_parse_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+        Ok(order) =>
+            match bigfix.b256_of_nat(order)
+                Ok(x)  =>
+                    test.assert_eq(bigfix.b256_bit_len(x), 256)
+                    test.assert_eq(bytes.len(bigfix.b256_to_be_bytes(x)), 32)
+                    test.assert_eq(bignum.nat_eq(bigfix.b256_to_nat(x), order), true)
+                    test.assert_eq(bigfix.b256_to_hex(x).len(), 64)
+                    test.assert_eq(bigfix.b256_eq_ct(x, x), true)
+                    test.assert_eq(bigfix.b256_eq_ct(x, bigfix.b256_zero()), false)
+                Err(e) => test.fail(e.message())
+        Err(e)    => test.fail(e.message())
+    // 2^256 is one bit too wide, and that is the whole check.
+    match bignum.nat_shl(bignum.nat_one(), 256)
+        Ok(too_wide) =>
+            match bigfix.b256_of_nat(too_wide)
+                Ok(_)  => test.fail("2^256 does not fit 256 bits")
+                Err(e) =>
+                    match e
+                        BigWidthExceeded(bits, width) =>
+                            test.assert_eq(bits, 257)
+                            test.assert_eq(width, 256)
+                        _                             => test.fail("expected BigWidthExceeded: ${e.message()}")
+        Err(e)       => test.fail(e.message())
+
+@test
+fn test_a_fixed_width_decoder_takes_the_exact_length_and_no_other()
+    // A wire format that says 32 bytes means 32 bytes; quietly
+    // accepting 31 is how a truncated scalar becomes a valid-looking
+    // one.
+    match bigfix.b256_from_be_bytes(bytes.from_byte_list([1]))
+        Ok(_)  => test.fail("one byte is not a 32-byte encoding")
+        Err(e) =>
+            match e
+                BigBadByteLength(len, want) =>
+                    test.assert_eq(len, 1)
+                    test.assert_eq(want, 32)
+                _                           => test.fail("expected BigBadByteLength: ${e.message()}")
+    match bigfix.b256_from_hex("01")
+        Ok(_)  => test.fail("two hex digits is not a 64-digit encoding")
+        Err(_) => test.assert_eq(true, true)
+    test.assert_eq(bigfix.b256_bit_len(bigfix.b256_zero()), 0)
+
+@test
+fn test_the_rsa_widths_carry_a_modulus_and_encode_to_the_length_the_rfc_names()
+    // RFC 8017 § 4.1: an RSA signature is as many bytes as the modulus.
+    match bignum.nat_shl(bignum.nat_one(), 2047)
+        Ok(big) =>
+            match bigfix.b2048_of_nat(big)
+                Ok(x)  =>
+                    test.assert_eq(bigfix.b2048_bit_len(x), 2048)
+                    test.assert_eq(bytes.len(bigfix.b2048_to_be_bytes(x)), 256)
+                    test.assert_eq(bigfix.b2048_to_hex(x).len(), 512)
+                    test.assert_eq(bigfix.b2048_eq_ct(x, x), true)
+                    test.assert_eq(bignum.nat_eq(bigfix.b2048_to_nat(x), big), true)
+                    // A 2048-bit value squares into 4096 bits, which is
+                    // why a program with 2048-bit keys still meets the
+                    // wider type.
+                    let wide = bigfix.b2048_to_b4096(x)
+                    test.assert_eq(bigfix.b4096_bit_len(wide), 2048)
+                    match bigfix.b4096_to_b2048(wide)
+                        Ok(back) => test.assert_eq(bigfix.b2048_eq_ct(back, x), true)
+                        Err(e)   => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e)  => test.fail(e.message())
+    test.assert_eq(bigfix.b2048_bit_len(bigfix.b2048_zero()), 0)
+    test.assert_eq(bigfix.b4096_bit_len(bigfix.b4096_zero()), 0)
+
+@test
+fn test_widening_is_total_and_narrowing_is_the_call_that_owes_a_check()
+    match bignum.nat_from_int(7)
+        Ok(seven) =>
+            match bigfix.b256_of_nat(seven)
+                Ok(small) =>
+                    let up = bigfix.b256_to_b2048(small)
+                    test.assert_eq(bigfix.b2048_bit_len(up), 3)
+                Err(e)    => test.fail(e.message())
+        Err(e)    => test.fail(e.message())
+    match bignum.nat_shl(bignum.nat_one(), 3000)
+        Ok(huge) =>
+            match bigfix.b4096_of_nat(huge)
+                Ok(x)  =>
+                    test.assert_eq(bigfix.b4096_bit_len(x), 3001)
+                    test.assert_eq(bytes.len(bigfix.b4096_to_be_bytes(x)), 512)
+                    test.assert_eq(bigfix.b4096_to_hex(x).len(), 1024)
+                    test.assert_eq(bigfix.b4096_eq_ct(x, x), true)
+                    test.assert_eq(bignum.nat_eq(bigfix.b4096_to_nat(x), huge), true)
+                    match bigfix.b4096_to_b2048(x)
+                        Ok(_)  => test.fail("3001 bits does not fit 2048")
+                        Err(e) =>
+                            match e
+                                BigWidthExceeded(bits, width) =>
+                                    test.assert_eq(bits, 3001)
+                                    test.assert_eq(width, 2048)
+                                _                             => test.fail("expected BigWidthExceeded: ${e.message()}")
+                Err(e) => test.fail(e.message())
+            match bigfix.b2048_of_nat(huge)
+                Ok(_)  => test.fail("3001 bits does not fit 2048")
+                Err(_) => test.assert_eq(true, true)
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_the_wide_fixed_types_decode_only_their_exact_byte_and_hex_lengths()
+    match bigfix.b2048_from_be_bytes(bytes.from_byte_list([1]))
+        Ok(_)  => test.fail("one byte is not a 256-byte encoding")
+        Err(_) => test.assert_eq(true, true)
+    match bigfix.b4096_from_be_bytes(bytes.from_byte_list([1]))
+        Ok(_)  => test.fail("one byte is not a 512-byte encoding")
+        Err(_) => test.assert_eq(true, true)
+    match bigfix.b2048_from_hex("ff")
+        Ok(_)  => test.fail("two hex digits is not a 512-digit encoding")
+        Err(_) => test.assert_eq(true, true)
+    match bigfix.b4096_from_hex("ff")
+        Ok(_)  => test.fail("two hex digits is not a 1024-digit encoding")
+        Err(_) => test.assert_eq(true, true)

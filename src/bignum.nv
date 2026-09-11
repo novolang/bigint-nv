@@ -1,0 +1,569 @@
+// bignum — the magnitude and the signed number, and the arithmetic
+// over them.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE REPRESENTATION, WHICH IS THE WHOLE DESIGN.  A magnitude is a list
+// of `Int`s, little-endian — `limbs[0]` is the least significant — and
+// each limb holds 28 BITS.  Not 32, and not 64, and the reason is the
+// multiply: novo-lang's `Int` is an `i64` and there is no widening
+// product, so `a * b` for two limbs has to fit in 63 bits by itself.
+// Two 32-bit limbs multiply to 64 and overflow; two 28-bit limbs
+// multiply to 56, and the inner loop's whole step —
+//
+//     p = a[i] * b[j] + acc[i + j] + carry
+//
+// — is at most `(2^28 - 1)^2 + (2^28 - 1) + (2^28 - 1)`, which is under
+// 2^56.  That bound does not depend on how many limbs the operands
+// have, because the carry is propagated at every step rather than a
+// whole column being accumulated first, so a 4096-bit multiply is as
+// safe as a 64-bit one.  `BIG_LIMB_BITS` and `BIG_LIMB_MASK` are the
+// two numbers, published because the fixed-width types in `bigfix` are
+// sized in them.
+//
+// CANONICAL FORM.  A magnitude carries no leading zero limbs, so zero
+// is the empty list and `limb_count` is the significant length.  Two
+// magnitudes that are equal are equal limb for limb, which is what
+// makes `eq` a list comparison and what makes a hash of the limbs
+// sound.  Every function here answers a canonical value; a caller that
+// builds a `BigNat` by writing the field itself and leaves a zero on
+// top has built something this package's own comparisons will disagree
+// with.
+//
+// SIGN AND MAGNITUDE, NOT TWO'S COMPLEMENT.  `BigNum` is a sign and a
+// `BigNat`, which is what num-bigint and CPython both do, and it is why
+// `neg` is free and why the bitwise operations are the awkward ones:
+// `bit_and`, `bit_or` and `bit_xor` over negative numbers are defined as
+// though the value had an infinite run of sign bits above it, so each of
+// them is specified below rather than left to the representation.
+//
+// WHY THE SIGNED TYPE IS NOT CALLED `BigInt`.  The standard library
+// already declares `struct BigInt`, and a package may not redeclare a
+// stdlib type at all (docs/publishing.md, "Public type names are
+// globally unique").  The same rule is why the MODULE is `bignum` and
+// not `bigint`: `bigint` is a standard library module name and a
+// package that shipped one would be refused at build.
+
+// How many bits one limb holds: 28.
+//
+// The arithmetic reason is in the module comment.  The practical one is
+// that it is the largest limb size for which the whole inner step of a
+// schoolbook multiply — product plus accumulator plus carry — stays
+// inside a signed 64-bit integer for operands of ANY length.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     println("${bignum.BIG_LIMB_BITS}")   // 28
+// ```
+pub const BIG_LIMB_BITS = 28
+
+// The mask that keeps a limb: `2^28 - 1`, or `0x0FFFFFFF`.
+pub const BIG_LIMB_MASK = 268435455
+
+// The limb count at which multiplication switches from schoolbook to
+// Karatsuba: 32 limbs, which is 896 bits.
+//
+// Karatsuba trades one of the four half-size multiplies for a handful
+// of additions, so it wins asymptotically and loses on small operands
+// where the additions and the recursion cost more than the multiply
+// they saved.  32 is num-bigint's own threshold and the one this
+// package starts from; it is published rather than hidden because a
+// benchmark on a different machine is the only thing that can move it,
+// and a reader comparing this implementation with another needs to
+// know where the switch is before the numbers mean anything.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     println("${bignum.BIG_KARATSUBA_LIMBS}")   // 32
+// ```
+pub const BIG_KARATSUBA_LIMBS = 32
+
+// BigNat is a non-negative integer of any size: its limbs, little-end
+// first, 28 bits each, with no leading zero limb.
+//
+// Zero is the EMPTY list.  That is not a special case bolted on — it
+// falls out of "no leading zero limb" — and it is why `is_zero` is a
+// length test and why `limb_count` is also the number of significant
+// limbs.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     match bignum.nat_from_int(255)
+//         Ok(a)  => println("${bignum.limb_count(a)}")   // 1
+//         Err(e) => println(e.message())
+// ```
+pub struct BigNat
+    // The limbs, least significant first.  Every entry is in
+    // `0 ..= BIG_LIMB_MASK`, and the last entry is never zero.
+    limbs: [Int]
+
+// BigNum is a signed integer: a sign and a magnitude.
+//
+// `sign` is -1, 0 or +1, and it is 0 exactly when the magnitude is
+// zero — there is no negative zero, which is what makes `eq` a field
+// comparison.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     let n = bignum.from_int(-7)
+//     println("${bignum.sign(n)}")   // -1
+// ```
+pub struct BigNum
+    // -1, 0 or +1.  Zero exactly when `mag` is zero.
+    sign: Int
+    // The absolute value.
+    mag: BigNat
+
+// ── building a magnitude ────────────────────────────────────────────
+
+// The magnitude zero: no limbs at all.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     println("${bignum.is_zero(bignum.nat_zero())}")   // true
+// ```
+pub fn nat_zero() -> BigNat []
+    todo("bigint-nv.bignum.nat_zero")
+
+// The magnitude one.
+pub fn nat_one() -> BigNat []
+    todo("bigint-nv.bignum.nat_one")
+
+// The magnitude of a non-negative `Int`, split into 28-bit limbs.
+//
+// `BigNegativeValue` for a negative argument: a magnitude has no sign,
+// and silently taking the absolute value would make
+// `nat_from_int(-1)` and `nat_from_int(1)` the same value, which is the
+// kind of quiet agreement that hides a sign error for a year.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     match bignum.nat_from_int(268435456)
+//         Ok(a)  => println("${bignum.limb_count(a)}")   // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn nat_from_int(value: Int) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bignum.nat_from_int")
+
+// The magnitude built from limbs the caller already holds, canonicalised.
+//
+// Leading zero limbs are dropped and a limb above `BIG_LIMB_MASK` is
+// carried, so a caller that assembled limbs by hand gets a value the
+// rest of this package agrees with rather than one that compares
+// unequal to itself.  Total: a negative limb is folded in by the same
+// carry walk, and there is nothing left for it to refuse.
+pub fn nat_from_limbs(limbs: [Int]) -> BigNat []
+    todo("bigint-nv.bignum.nat_from_limbs")
+
+// The limbs of a magnitude, least significant first.
+//
+// The canonical list: no leading zero, and empty for zero.
+pub fn nat_limbs(a: BigNat) -> [Int] []
+    todo("bigint-nv.bignum.nat_limbs")
+
+// How many limbs the magnitude significantly occupies.  Zero for zero.
+pub fn limb_count(a: BigNat) -> Int []
+    todo("bigint-nv.bignum.limb_count")
+
+// How many BITS the magnitude occupies: the position of its highest set
+// bit plus one, and 0 for zero.
+//
+// This is the number a key size is quoted in, and it is what
+// `bigfix.of_nat` compares against a fixed width.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     match bignum.nat_from_int(255)
+//         Ok(a)  => println("${bignum.bit_len(a)}")   // 8
+//         Err(e) => println(e.message())
+// ```
+pub fn bit_len(a: BigNat) -> Int []
+    todo("bigint-nv.bignum.bit_len")
+
+// Whether the magnitude is zero.
+pub fn is_zero(a: BigNat) -> Bool []
+    todo("bigint-nv.bignum.is_zero")
+
+// Whether the magnitude is odd — its lowest bit.
+//
+// Cheap, and asked constantly: a square-and-multiply exponent loop
+// tests it once per bit, and `bigmod.montgomery` refuses an even
+// modulus.
+pub fn is_odd(a: BigNat) -> Bool []
+    todo("bigint-nv.bignum.is_odd")
+
+// Bit `i` of the magnitude, counting from 0 at the least significant.
+//
+// `false` for an index at or above `bit_len`, which makes a loop over a
+// fixed window safe without a bound check of its own.
+pub fn nat_bit(a: BigNat, i: Int) -> Bool []
+    todo("bigint-nv.bignum.nat_bit")
+
+// The magnitude as an `Int`, when it fits.
+//
+// `BigNotRepresentable` with the value's bit length otherwise.  63 bits
+// is the limit, not 64: `Int` is signed, and a magnitude has no sign to
+// spend.
+pub fn nat_to_int(a: BigNat) -> Result<Int, BigFault> []
+    todo("bigint-nv.bignum.nat_to_int")
+
+// ── comparing magnitudes ────────────────────────────────────────────
+
+// Whether two magnitudes are equal.
+//
+// A list comparison, because both sides are canonical.
+pub fn nat_eq(left: BigNat, right: BigNat) -> Bool []
+    todo("bigint-nv.bignum.nat_eq")
+
+// -1, 0 or +1 as `left` is below, equal to or above `right`.
+//
+// Length first, then limbs from the top — which is why canonical form
+// earns its keep: without it the length test would be wrong.
+pub fn nat_cmp(left: BigNat, right: BigNat) -> Int []
+    todo("bigint-nv.bignum.nat_cmp")
+
+// ── magnitude arithmetic ────────────────────────────────────────────
+
+// The sum of two magnitudes.
+//
+// Cannot fail: the result grows by at most one limb.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     match bignum.nat_from_int(1)
+//         Ok(one) => println("${bignum.limb_count(bignum.nat_add(one, one))}")   // 1
+//         Err(e)  => println(e.message())
+// ```
+pub fn nat_add(left: BigNat, right: BigNat) -> BigNat []
+    todo("bigint-nv.bignum.nat_add")
+
+// The difference `left - right`, which a magnitude can only answer when
+// it is non-negative.
+//
+// `BigNegativeValue` when `right` is the larger, because a `BigNat` has
+// nowhere to put a sign.  A caller who wants a signed difference uses
+// `sub` over `BigNum`, and a caller who is subtracting inside a loop
+// they know is descending uses this one and gets told when they were
+// wrong.
+pub fn nat_sub(left: BigNat, right: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bignum.nat_sub")
+
+// The product of two magnitudes.
+//
+// Schoolbook below `BIG_KARATSUBA_LIMBS` limbs on the shorter operand
+// and Karatsuba at or above it, recursing until the halves are below
+// the threshold again.  The two agree exactly — this is integer
+// arithmetic, and there is no tolerance anywhere in this package — so
+// the threshold is a speed decision and never a correctness one, and
+// the test suite multiplies the same pairs on both sides of it.
+pub fn nat_mul(left: BigNat, right: BigNat) -> BigNat []
+    todo("bigint-nv.bignum.nat_mul")
+
+// The square of a magnitude.
+//
+// Not `nat_mul(a, a)`: squaring has a form of its own in which every
+// off-diagonal product appears twice and is computed once, which is
+// roughly a 2x saving and is worth naming because a modular
+// exponentiation squares once per exponent bit and multiplies only for
+// the bits that are set.
+pub fn nat_sqr(a: BigNat) -> BigNat []
+    todo("bigint-nv.bignum.nat_sqr")
+
+// The quotient and the remainder of `left` divided by `right`, as a
+// pair in that order.
+//
+// Knuth's algorithm D: normalise so the divisor's top limb has its high
+// bit set, estimate each quotient limb from the top two limbs of the
+// remainder and the top limb of the divisor, correct the estimate at
+// most twice, and denormalise.  The remainder is always in
+// `0 ..= right - 1`, so this is Euclidean division and matches what
+// `nat_rem` answers.
+//
+// `BigDivideByZero` when `right` is zero.
+//
+// ```novo
+// use bignum
+// use bigfmt
+//
+// fn main() [io]
+//     match bignum.nat_from_int(17)
+//         Ok(a) =>
+//             match bignum.nat_from_int(5)
+//                 Ok(b) =>
+//                     match bignum.nat_divmod(a, b)
+//                         Ok(qr) => println(bigfmt.nat_to_decimal(qr.quotient))   // 3
+//                         Err(e) => println(e.message())
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn nat_divmod(left: BigNat, right: BigNat) -> Result<BigDivision, BigFault> []
+    todo("bigint-nv.bignum.nat_divmod")
+
+// BigDivision is a quotient and a remainder, which division answers
+// together because the algorithm produces both and computing one twice
+// to get the other is the most expensive mistake this package invites.
+//
+// A struct rather than a tuple because a `Result` payload reads better
+// named, and because `qr.0` and `qr.1` at a call site three screens
+// from the division is exactly how a quotient gets used as a remainder.
+pub struct BigDivision
+    // `left / right`, truncated toward zero, which for two magnitudes
+    // is simply floor.
+    quotient: BigNat
+    // `left - quotient * right`, in `0 ..= right - 1`.
+    remainder: BigNat
+
+// The quotient alone.  `BigDivideByZero` for a zero divisor.
+pub fn nat_div(left: BigNat, right: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bignum.nat_div")
+
+// The remainder alone, in `0 ..= right - 1`.  `BigDivideByZero` for a
+// zero divisor.
+pub fn nat_rem(left: BigNat, right: BigNat) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bignum.nat_rem")
+
+// `base` raised to a non-negative `exponent`, over the integers.
+//
+// `BigNegativeExponent` for a negative one.  There is no upper bound
+// and there is no warning: `nat_pow(nat_from_int(2), 1000000)` is a
+// 125 KB number and this will build it.  A caller working modulo
+// something wants `bigmod.pow`, which never grows past the modulus.
+pub fn nat_pow(base: BigNat, exponent: Int) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bignum.nat_pow")
+
+// The greatest common divisor of two magnitudes.
+//
+// The binary (Stein) algorithm: shifts and subtractions, no division.
+// `gcd(0, b)` is `b` and `gcd(0, 0)` is 0, which are the conventional
+// answers and the ones that make `lcm` total.
+pub fn nat_gcd(left: BigNat, right: BigNat) -> BigNat []
+    todo("bigint-nv.bignum.nat_gcd")
+
+// ── shifts and bits over a magnitude ────────────────────────────────
+
+// The magnitude shifted left by `by` bits — multiplied by `2^by`.
+//
+// `BigNegativeShift` for a negative count.  There is no overflow to
+// refuse: the result simply gets longer.
+pub fn nat_shl(a: BigNat, by: Int) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bignum.nat_shl")
+
+// The magnitude shifted right by `by` bits — divided by `2^by`, with
+// the bits shifted out discarded.
+//
+// `BigNegativeShift` for a negative count.  A shift past `bit_len`
+// answers zero rather than refusing, which is what makes a windowed
+// exponent loop terminate without a bound test.
+pub fn nat_shr(a: BigNat, by: Int) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bignum.nat_shr")
+
+// The bitwise AND of two magnitudes.
+pub fn nat_bit_and(left: BigNat, right: BigNat) -> BigNat []
+    todo("bigint-nv.bignum.nat_bit_and")
+
+// The bitwise OR of two magnitudes.
+pub fn nat_bit_or(left: BigNat, right: BigNat) -> BigNat []
+    todo("bigint-nv.bignum.nat_bit_or")
+
+// The bitwise XOR of two magnitudes.
+pub fn nat_bit_xor(left: BigNat, right: BigNat) -> BigNat []
+    todo("bigint-nv.bignum.nat_bit_xor")
+
+// How many bits of the magnitude are set — its population count.
+//
+// The Hamming weight of an exponent is how many multiplies a
+// square-and-multiply loop performs, so a caller sizing a modular
+// exponentiation asks this.
+pub fn nat_popcount(a: BigNat) -> Int []
+    todo("bigint-nv.bignum.nat_popcount")
+
+// How many low bits of the magnitude are zero, and 0 for zero itself.
+//
+// The count a binary GCD strips and the one that says how many times a
+// modulus divides by two — which is the first question Montgomery form
+// and every Miller-Rabin test both ask.
+pub fn nat_trailing_zeros(a: BigNat) -> Int []
+    todo("bigint-nv.bignum.nat_trailing_zeros")
+
+// ── building a signed number ────────────────────────────────────────
+
+// Zero.
+pub fn zero() -> BigNum []
+    todo("bigint-nv.bignum.zero")
+
+// One.
+pub fn one() -> BigNum []
+    todo("bigint-nv.bignum.one")
+
+// The signed number equal to an `Int`.  Total — every `Int` fits.
+//
+// ```novo
+// use bignum
+//
+// fn main() [io]
+//     println("${bignum.sign(bignum.from_int(-7))}")   // -1
+// ```
+pub fn from_int(value: Int) -> BigNum []
+    todo("bigint-nv.bignum.from_int")
+
+// A signed number from a sign and a magnitude.
+//
+// The sign is normalised: any negative `sign` means negative, any
+// positive means positive, and a zero magnitude forces sign 0 whatever
+// was asked for.  So there is no negative zero and nothing to refuse.
+pub fn of_sign_mag(sign: Int, mag: BigNat) -> BigNum []
+    todo("bigint-nv.bignum.of_sign_mag")
+
+// -1, 0 or +1.
+pub fn sign(n: BigNum) -> Int []
+    todo("bigint-nv.bignum.sign")
+
+// The absolute value, as a magnitude.
+pub fn magnitude(n: BigNum) -> BigNat []
+    todo("bigint-nv.bignum.magnitude")
+
+// The signed number as an `Int`, when it fits.
+//
+// `BigNotRepresentable` with the magnitude's bit length otherwise.
+pub fn to_int(n: BigNum) -> Result<Int, BigFault> []
+    todo("bigint-nv.bignum.to_int")
+
+// ── signed arithmetic ───────────────────────────────────────────────
+
+// The sum.
+pub fn add(left: BigNum, right: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.add")
+
+// The difference.  Total, which is the whole reason the signed type
+// exists beside the magnitude.
+pub fn sub(left: BigNum, right: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.sub")
+
+// The product.  The sign is the product of the signs; the magnitude is
+// `nat_mul`.
+pub fn mul(left: BigNum, right: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.mul")
+
+// The negation.  `neg(zero())` is zero.
+pub fn neg(n: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.neg")
+
+// The absolute value, as a signed number.
+pub fn abs(n: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.abs")
+
+// The quotient and remainder, TRUNCATED toward zero — the C, Rust and
+// num-bigint convention, where the remainder takes the sign of the
+// dividend: `divmod(-7, 2)` is `(-3, -1)`.
+//
+// Python's `//` and `%` floor instead and give `(-4, 1)`, and the
+// difference is a real one that has cost real money.  This package
+// publishes BOTH, under names that say which is which, rather than
+// picking one and leaving a reader to find out: `divmod` truncates and
+// `floordivmod` floors.
+//
+// `BigDivideByZero` for a zero divisor.
+pub fn divmod(left: BigNum, right: BigNum) -> Result<BigNumDivision, BigFault> []
+    todo("bigint-nv.bignum.divmod")
+
+// BigNumDivision is a signed quotient and remainder, together for the
+// same reason `BigDivision` is.
+pub struct BigNumDivision
+    // The quotient, rounded as the function that produced it says.
+    quotient: BigNum
+    // The remainder.  `left == quotient * right + remainder` holds for
+    // both rounding rules; what differs is which side of zero the
+    // remainder lands on.
+    remainder: BigNum
+
+// The quotient and remainder, FLOORED — Python's `//` and `%`, where
+// the remainder takes the sign of the divisor: `floordivmod(-7, 2)` is
+// `(-4, 1)`.
+//
+// This is the one a caller reducing into `0 ..= n - 1` wants, and it is
+// why `bigmod.of_num` is written in terms of it.
+//
+// `BigDivideByZero` for a zero divisor.
+pub fn floordivmod(left: BigNum, right: BigNum) -> Result<BigNumDivision, BigFault> []
+    todo("bigint-nv.bignum.floordivmod")
+
+// `base` raised to a non-negative `exponent`.
+//
+// `BigNegativeExponent` for a negative one — the integers are not
+// closed under it, and returning a rational would be a different
+// package.
+pub fn pow(base: BigNum, exponent: Int) -> Result<BigNum, BigFault> []
+    todo("bigint-nv.bignum.pow")
+
+// Whether two signed numbers are equal.
+pub fn eq(left: BigNum, right: BigNum) -> Bool []
+    todo("bigint-nv.bignum.eq")
+
+// -1, 0 or +1 as `left` is below, equal to or above `right`.
+pub fn cmp(left: BigNum, right: BigNum) -> Int []
+    todo("bigint-nv.bignum.cmp")
+
+// ── signed bitwise, over the two's-complement reading ───────────────
+
+// The bitwise AND, over the INFINITE two's-complement reading of both
+// operands.
+//
+// A sign-and-magnitude value has no sign bits to hand, so the rule has
+// to be stated rather than derived: a negative number is read as though
+// it had an endless run of 1 bits above its highest limb, and a
+// non-negative one an endless run of 0s.  `bit_and(-1, x)` is `x`,
+// `bit_and(-2, -2)` is `-2`, and the result is negative exactly when both
+// operands are.  That is what Python and num-bigint both do, and a
+// package that quietly did something else here would be wrong in a way
+// no test of small positive numbers would catch.
+pub fn bit_and(left: BigNum, right: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.bit_and")
+
+// The bitwise OR, over the same infinite two's-complement reading.  The
+// result is negative when either operand is.
+pub fn bit_or(left: BigNum, right: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.bit_or")
+
+// The bitwise XOR, over the same reading.  The result is negative when
+// exactly one operand is.
+pub fn bit_xor(left: BigNum, right: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.bit_xor")
+
+// The bitwise complement: `bit_not(x)` is `-x - 1`, which is what two's
+// complement means and is total over the signed numbers.
+pub fn bit_not(n: BigNum) -> BigNum []
+    todo("bigint-nv.bignum.bit_not")
+
+// The signed number shifted left by `by` bits.
+//
+// `BigNegativeShift` for a negative count.
+pub fn shl(n: BigNum, by: Int) -> Result<BigNum, BigFault> []
+    todo("bigint-nv.bignum.shl")
+
+// The signed number shifted right by `by` bits, ARITHMETICALLY: the
+// result floors, so `shr(-1, 10)` is `-1` and not 0.
+//
+// The choice follows from the two's-complement reading above, and it is
+// what makes `shr(n, 1)` and dividing by two agree for every n rather
+// than for the non-negative ones only.
+//
+// `BigNegativeShift` for a negative count.
+pub fn shr(n: BigNum, by: Int) -> Result<BigNum, BigFault> []
+    todo("bigint-nv.bignum.shr")

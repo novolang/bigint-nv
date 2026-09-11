@@ -1,0 +1,316 @@
+// bigfix — the three widths the crypto tier actually uses, as types
+// that carry their width instead of asserting it.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY A FIXED-WIDTH TYPE AT ALL, WHEN `BigNat` HOLDS ANY NUMBER.  Two
+// reasons, and only the second is about speed.
+//
+// The first is that a width is a fact about a protocol and belongs in
+// the type.  A P-256 scalar is 256 bits; an RSA-2048 modulus is 2048.
+// A function that takes a `BigNat` and means "a 256-bit scalar" has
+// written that in a comment, and a caller who passes a 512-bit value
+// finds out at run time if at all.  `Big256` is checked where it is
+// constructed, once, and everything downstream of that construction is
+// a type error rather than a fact somebody has to remember.
+//
+// The second is that a fixed limb count is what an implementation needs
+// to unroll anything.  A 256-bit Montgomery multiply over ten limbs
+// with the count known at compile time is a different program from a
+// loop over a list whose length arrives at run time, and this is the
+// type that makes the first one writable later without changing any
+// caller.
+//
+// THE LIMB COUNTS ARE 10, 74 AND 147, and they look strange because 28
+// does not divide 256.  `ceil(256 / 28)` is 10, `ceil(2048 / 28)` is 74
+// and `ceil(4096 / 28)` is 147, with 24, 24 and 20 bits of the top limb
+// unused respectively.  The alternative — a limb size that divides the
+// widths — is 32, and 32-bit limbs do not multiply inside an `i64`
+// (`bignum`'s module comment has the arithmetic).  Padding is what that
+// costs, and it is published as a constant per width rather than
+// recomputed by every reader.
+//
+// THESE ARE BOXED STRUCTS, NOT `@value` ONES, and that is deliberate
+// rather than an oversight.  A `@value` struct may not be a `Result`
+// payload (E2015) and may not be a field of a boxed struct, and every
+// constructor here is fallible and every one of these types is meant to
+// sit inside a key structure.  The consequence is that a `Big256` is a
+// heap value like any other and this module makes NO `@tier(embedded)`
+// claim — see the README, "The layer, and why".  A device that needs
+// 256-bit field arithmetic without a heap wants a `@value` type with an
+// inline array, which is exactly what ed25519-nv's `Fe25519` is, and
+// that is the right home for it.
+//
+// WHAT IS NOT HERE.  No arithmetic.  Not one `add`, `mul` or `pow`.
+// These types are a WIDTH-CHECKED CARRIER: they convert to and from
+// `BigNat`, to and from fixed-length big-endian bytes, and to and from
+// hexadecimal, and computation happens in `bignum` and `bigmod` where
+// it is written once.  A module that also carried three copies of
+// modular exponentiation, one per width, would be three times the
+// surface for the same arithmetic and would drift.  The implementation
+// lane may add width-specialised bodies BEHIND `bigmod`'s signatures;
+// it may not add a second public arithmetic surface here.
+
+use std.bytes
+
+// The width of `Big256` in bits.
+pub const BIG256_BITS = 256
+
+// How many 28-bit limbs a `Big256` holds: `ceil(256 / 28)`.
+//
+// ```novo
+// use bigfix
+//
+// fn main() [io]
+//     println("${bigfix.BIG256_LIMBS}")   // 10
+// ```
+pub const BIG256_LIMBS = 10
+
+// How many big-endian bytes a `Big256` encodes to: 32.
+pub const BIG256_BYTES = 32
+
+// The width of `Big2048` in bits.
+pub const BIG2048_BITS = 2048
+
+// How many 28-bit limbs a `Big2048` holds: `ceil(2048 / 28)`.
+pub const BIG2048_LIMBS = 74
+
+// How many big-endian bytes a `Big2048` encodes to: 256.
+pub const BIG2048_BYTES = 256
+
+// The width of `Big4096` in bits.
+pub const BIG4096_BITS = 4096
+
+// How many 28-bit limbs a `Big4096` holds: `ceil(4096 / 28)`.
+pub const BIG4096_LIMBS = 147
+
+// How many big-endian bytes a `Big4096` encodes to: 512.
+pub const BIG4096_BYTES = 512
+
+// Big256 is an unsigned integer below `2^256`: a curve scalar, a field
+// element, a coordinate, a hash reduced into a group.
+//
+// The limb list is always exactly `BIG256_LIMBS` long, zero-padded at
+// the top — NOT canonical the way a `BigNat` is — because a fixed
+// length is the whole point of the type: a comparison, a select and a
+// multiply over two of these touch the same number of limbs whatever
+// the values are, which is what a constant-time operation needs.
+//
+// ```novo
+// use bignum
+// use bigfix
+//
+// fn main() [io]
+//     match bignum.nat_from_int(1)
+//         Ok(a) =>
+//             match bigfix.b256_of_nat(a)
+//                 Ok(x) => println("${bigfix.b256_bit_len(x)}")   // 1
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct Big256
+    // Exactly `BIG256_LIMBS` limbs, least significant first, each in
+    // `0 ..= BIG_LIMB_MASK`, top ones zero when the value is small.
+    limbs: [Int]
+
+// Big2048 is an unsigned integer below `2^2048`: an RSA-2048 modulus,
+// a signature, a ciphertext, an exponent.
+//
+// Same invariant as `Big256` at `BIG2048_LIMBS`.
+pub struct Big2048
+    // Exactly `BIG2048_LIMBS` limbs, least significant first.
+    limbs: [Int]
+
+// Big4096 is an unsigned integer below `2^4096`: an RSA-4096 modulus
+// and everything computed against one.
+//
+// Same invariant as `Big256` at `BIG4096_LIMBS`.
+//
+// The width exists because RSA-4096 is what a long-lived root key is,
+// and because an RSA-2048 CRT computation squares into 4096 bits on the
+// way — so a caller working with 2048-bit keys still meets this type.
+pub struct Big4096
+    // Exactly `BIG4096_LIMBS` limbs, least significant first.
+    limbs: [Int]
+
+// ── Big256 ──────────────────────────────────────────────────────────
+
+// Zero as a `Big256`.
+pub fn b256_zero() -> Big256 []
+    todo("bigint-nv.bigfix.b256_zero")
+
+// A `Big256` from a magnitude.
+//
+// `BigWidthExceeded` with the value's bit length and 256 when it does
+// not fit.  This is the ONE check, and everything downstream of it is a
+// type rather than an assertion.
+pub fn b256_of_nat(a: BigNat) -> Result<Big256, BigFault> []
+    todo("bigint-nv.bigfix.b256_of_nat")
+
+// The magnitude a `Big256` holds, canonicalised — leading zero limbs
+// dropped, so it compares and prints like any other `BigNat`.
+pub fn b256_to_nat(x: Big256) -> BigNat []
+    todo("bigint-nv.bigfix.b256_to_nat")
+
+// A `Big256` from exactly `BIG256_BYTES` big-endian bytes.
+//
+// `BigBadByteLength` with the length that arrived and 32 for anything
+// else, INCLUDING a shorter string that would have fitted.  A wire
+// format that says 32 bytes means 32 bytes, and quietly accepting 31
+// is how a truncated value becomes a valid-looking scalar.
+//
+// ```novo
+// use std.bytes
+// use bigfix
+//
+// fn main() [io]
+//     match bigfix.b256_from_be_bytes(bytes.from_byte_list([0]))
+//         Ok(x)  => println("${bigfix.b256_bit_len(x)}")
+//         Err(e) => println(e.message())
+//         // bigint: 1 byte where 32 were required
+// ```
+pub fn b256_from_be_bytes(b: Bytes) -> Result<Big256, BigFault> []
+    todo("bigint-nv.bigfix.b256_from_be_bytes")
+
+// A `Big256` as exactly `BIG256_BYTES` big-endian bytes, zero-padded.
+//
+// Total: the value cannot be too wide, because the type is the width.
+// That totality is the point of the type — this is the encoder every
+// signature and every coordinate goes through, and it cannot fail.
+pub fn b256_to_be_bytes(x: Big256) -> Bytes []
+    todo("bigint-nv.bigfix.b256_to_be_bytes")
+
+// A `Big256` from exactly 64 hexadecimal digits, either case, no
+// separators.
+//
+// The form a test vector and a provisioned key are both written in.
+// `BigBadByteLength` for the wrong number of digits and `BigBadDigit`
+// with the offset for a character that is not one.
+pub fn b256_from_hex(text: Str) -> Result<Big256, BigFault> []
+    todo("bigint-nv.bigfix.b256_from_hex")
+
+// A `Big256` as exactly 64 lowercase hexadecimal digits.  Total.
+pub fn b256_to_hex(x: Big256) -> Str []
+    todo("bigint-nv.bigfix.b256_to_hex")
+
+// How many bits the VALUE occupies, ignoring the padding: 0 for zero,
+// 256 for the largest.
+//
+// The padded limb list's length is the width and says nothing.
+pub fn b256_bit_len(x: Big256) -> Int []
+    todo("bigint-nv.bigfix.b256_bit_len")
+
+// Whether two `Big256` values are equal, over all `BIG256_LIMBS` limbs,
+// in time that does not depend on where they differ.
+//
+// Fixed length is what makes this one sound where `bigmod.eq_ct` needs
+// a precondition.
+pub fn b256_eq_ct(a: Big256, b: Big256) -> Bool []
+    todo("bigint-nv.bigfix.b256_eq_ct")
+
+// ── Big2048 ─────────────────────────────────────────────────────────
+
+// Zero as a `Big2048`.
+pub fn b2048_zero() -> Big2048 []
+    todo("bigint-nv.bigfix.b2048_zero")
+
+// A `Big2048` from a magnitude.  `BigWidthExceeded` above 2048 bits.
+pub fn b2048_of_nat(a: BigNat) -> Result<Big2048, BigFault> []
+    todo("bigint-nv.bigfix.b2048_of_nat")
+
+// The magnitude a `Big2048` holds, canonicalised.
+pub fn b2048_to_nat(x: Big2048) -> BigNat []
+    todo("bigint-nv.bigfix.b2048_to_nat")
+
+// A `Big2048` from exactly `BIG2048_BYTES` big-endian bytes.
+//
+// `BigBadByteLength` for any other length.  This is the call that reads
+// an RSA-2048 modulus out of a PKCS#1 structure asn1-nv parsed.
+pub fn b2048_from_be_bytes(b: Bytes) -> Result<Big2048, BigFault> []
+    todo("bigint-nv.bigfix.b2048_from_be_bytes")
+
+// A `Big2048` as exactly `BIG2048_BYTES` big-endian bytes.  Total.
+//
+// The encoding of an RSA signature: 256 bytes, leading zeros and all,
+// because RFC 8017 § 4.1 says the length is the modulus's and a
+// verifier that received 255 would reject.
+pub fn b2048_to_be_bytes(x: Big2048) -> Bytes []
+    todo("bigint-nv.bigfix.b2048_to_be_bytes")
+
+// A `Big2048` from exactly 512 hexadecimal digits, either case.
+pub fn b2048_from_hex(text: Str) -> Result<Big2048, BigFault> []
+    todo("bigint-nv.bigfix.b2048_from_hex")
+
+// A `Big2048` as exactly 512 lowercase hexadecimal digits.  Total.
+pub fn b2048_to_hex(x: Big2048) -> Str []
+    todo("bigint-nv.bigfix.b2048_to_hex")
+
+// How many bits the value occupies.
+pub fn b2048_bit_len(x: Big2048) -> Int []
+    todo("bigint-nv.bigfix.b2048_bit_len")
+
+// Whether two `Big2048` values are equal, in time that does not depend
+// on where they differ.
+pub fn b2048_eq_ct(a: Big2048, b: Big2048) -> Bool []
+    todo("bigint-nv.bigfix.b2048_eq_ct")
+
+// ── Big4096 ─────────────────────────────────────────────────────────
+
+// Zero as a `Big4096`.
+pub fn b4096_zero() -> Big4096 []
+    todo("bigint-nv.bigfix.b4096_zero")
+
+// A `Big4096` from a magnitude.  `BigWidthExceeded` above 4096 bits.
+pub fn b4096_of_nat(a: BigNat) -> Result<Big4096, BigFault> []
+    todo("bigint-nv.bigfix.b4096_of_nat")
+
+// The magnitude a `Big4096` holds, canonicalised.
+pub fn b4096_to_nat(x: Big4096) -> BigNat []
+    todo("bigint-nv.bigfix.b4096_to_nat")
+
+// A `Big4096` from exactly `BIG4096_BYTES` big-endian bytes.
+pub fn b4096_from_be_bytes(b: Bytes) -> Result<Big4096, BigFault> []
+    todo("bigint-nv.bigfix.b4096_from_be_bytes")
+
+// A `Big4096` as exactly `BIG4096_BYTES` big-endian bytes.  Total.
+pub fn b4096_to_be_bytes(x: Big4096) -> Bytes []
+    todo("bigint-nv.bigfix.b4096_to_be_bytes")
+
+// A `Big4096` from exactly 1024 hexadecimal digits, either case.
+pub fn b4096_from_hex(text: Str) -> Result<Big4096, BigFault> []
+    todo("bigint-nv.bigfix.b4096_from_hex")
+
+// A `Big4096` as exactly 1024 lowercase hexadecimal digits.  Total.
+pub fn b4096_to_hex(x: Big4096) -> Str []
+    todo("bigint-nv.bigfix.b4096_to_hex")
+
+// How many bits the value occupies.
+pub fn b4096_bit_len(x: Big4096) -> Int []
+    todo("bigint-nv.bigfix.b4096_bit_len")
+
+// Whether two `Big4096` values are equal, in time that does not depend
+// on where they differ.
+pub fn b4096_eq_ct(a: Big4096, b: Big4096) -> Bool []
+    todo("bigint-nv.bigfix.b4096_eq_ct")
+
+// ── between the widths ──────────────────────────────────────────────
+
+// A `Big256` widened to a `Big2048`.  Total — it fits by construction.
+pub fn b256_to_b2048(x: Big256) -> Big2048 []
+    todo("bigint-nv.bigfix.b256_to_b2048")
+
+// A `Big2048` widened to a `Big4096`.  Total.
+//
+// The call an RSA-2048 CRT step makes on the way into a product that
+// needs the room.
+pub fn b2048_to_b4096(x: Big2048) -> Big4096 []
+    todo("bigint-nv.bigfix.b2048_to_b4096")
+
+// A `Big4096` narrowed to a `Big2048`.
+//
+// `BigWidthExceeded` when the value needs more than 2048 bits — which
+// is the check a caller coming back down from a widened product owes,
+// and the reason this direction is fallible and the other is not.
+pub fn b4096_to_b2048(x: Big4096) -> Result<Big2048, BigFault> []
+    todo("bigint-nv.bigfix.b4096_to_b2048")

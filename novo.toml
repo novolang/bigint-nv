@@ -1,0 +1,55 @@
+[package]
+name        = "bigint-nv"
+version     = "0.0.1"
+description = "Arbitrary-precision integers in novo-lang itself: unsigned magnitudes over 28-bit limb lists, signed numbers over them, schoolbook and Karatsuba multiplication, division with remainder, shifts, bitwise operations, decimal and hexadecimal text, big-endian bytes, and the modular arithmetic the crypto tier needs — modular exponentiation, modular inverse, Montgomery form as a value built once per modulus, and fixed-width 256-, 2048- and 4096-bit types for curve and RSA sizes.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: every function is arithmetic over integers the caller already
+# holds.  Nothing is read, nothing is written, no clock and no entropy
+# is consulted — a modular inverse is a loop over limbs, and the random
+# a key generator needs arrives as bytes the caller supplies.
+#
+# The package makes NO `@tier(embedded)` claim, and there is no
+# `tests/embedded_probe.nv`, so the audit's `core-embedded` row passes
+# and says so.  The reason is the representation: a magnitude is a
+# limb LIST, and a list literal is a heap allocation `@tier(embedded)`
+# refuses (SPEC § 14.4).  A device that needs 256-bit field arithmetic
+# uses a fixed-size `@value` type — ed25519-nv's `Fe25519` is exactly
+# that shape — rather than a growable magnitude.  See README,
+# "The layer, and why".
+layer       = "core"
+
+category    = "science"
+
+tags = ["bigint", "bignum", "arbitrary-precision", "num-bigint", "modpow", "montgomery", "rsa", "crypto", "science"]
+repository  = "https://github.com/novolang/bigint-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Arbitrary-precision integers, and the modular arithmetic a signature needs"
+
+[dependencies]
+# None.  A magnitude is a list of integers and the arithmetic is the
+# language's own, so this package sits at the bottom of the `core`
+# stack and everything in the crypto tier can hold to it.
+#
+# NOT `std.bigint`.  The standard library's `Bigint` is a `void*` box
+# over the hand-rolled limb implementation in the runtime's C source:
+# it is add, sub, neg, cmp, sign and decimal text, it has no multiply,
+# no division and no modular arithmetic, and every one of its entry
+# points is marked "not embedded" and "LLVM only" — so it does not run
+# under the interpreter and it does not check at a tier.  This package
+# is the same subject written in novo-lang, which is what makes the
+# missing half writable at all.  README, "What std.bigint keeps",
+# says which of the two a caller should reach for.

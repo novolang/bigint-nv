@@ -1,0 +1,253 @@
+// bigfmt — a big number as text and as bytes, both ways.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THIS IS ITS OWN MODULE.  `bignum` is arithmetic over integers and
+// nothing in it touches a `Str` or a `Bytes`.  Conversion is where the
+// cost lives — a decimal rendering of an n-limb number is quadratic in
+// n by repeated division, and a hexadecimal one is linear because 28 is
+// not a multiple of 4 but the bits still line up — and separating them
+// keeps the arithmetic module readable and makes the expensive calls
+// visible in an import list.
+//
+// DECIMAL IS QUADRATIC AND HEXADECIMAL IS LINEAR, and a caller should
+// know which one they asked for.  `to_decimal` divides the whole number
+// by a power of ten once per output chunk, so rendering a 4096-bit
+// value is a few hundred divisions; `to_hex` walks the limbs once.  A
+// program logging a key every request wants the hex.  num-bigint has
+// the same shape and the same advice.
+//
+// BIG-ENDIAN BYTES, BECAUSE THAT IS WHERE THEY COME FROM.  Every byte
+// string this package will meet is big-endian: an RSA modulus in a
+// PKCS#1 structure, an ECDSA `r` and `s`, a Diffie-Hellman public
+// value, a hash reduced into a scalar.  So `nat_from_be_bytes` and
+// `nat_to_be_bytes` are the pair, and the little-endian direction is
+// NOT here — a caller who needs it reverses the list, which is one call
+// and is honest about what it is doing, rather than this package
+// carrying four functions where two are used.
+//
+// THE FIXED-LENGTH ENCODING IS A SEPARATE CALL.  `nat_to_be_bytes`
+// answers the shortest big-endian encoding with no leading zero, and
+// `nat_to_be_bytes_padded` answers exactly the length asked for.  They
+// are not one function with a default, because the crypto tier needs
+// the second one always — an ECDSA signature is two fixed 32-byte
+// integers and a leading zero that got stripped is a signature that
+// verifies nowhere — and a caller who reached for the convenient one by
+// accident would find out in production.
+
+use std.bytes
+
+// ── decimal and other radixes ───────────────────────────────────────
+
+// The magnitude as digits in base 10.
+//
+// No sign, no separators, no leading zero, and `"0"` for zero.
+//
+// Quadratic in the limb count: see the module comment.
+//
+// ```novo
+// use bignum
+// use bigfmt
+//
+// fn main() [io]
+//     match bignum.nat_from_int(255)
+//         Ok(a)  => println(bigfmt.nat_to_decimal(a))   // 255
+//         Err(e) => println(e.message())
+// ```
+pub fn nat_to_decimal(a: BigNat) -> Str []
+    todo("bigint-nv.bigfmt.nat_to_decimal")
+
+// The magnitude as digits in `radix`, which is 2 to 36 with lowercase
+// letters above 9.
+//
+// `BigBadRadix` outside that range.
+pub fn nat_to_radix(a: BigNat, radix: Int) -> Result<Str, BigFault> []
+    todo("bigint-nv.bigfmt.nat_to_radix")
+
+// The magnitude as lowercase hexadecimal, shortest form, `"0"` for
+// zero.
+//
+// Linear in the limb count, which is why it is named separately from
+// `nat_to_radix(a, 16)` even though the two agree: a caller reading
+// this signature is told the cost.
+pub fn nat_to_hex(a: BigNat) -> Str []
+    todo("bigint-nv.bigfmt.nat_to_hex")
+
+// The magnitude as lowercase hexadecimal, padded with leading zeros to
+// exactly `digits` characters.
+//
+// `BigWidthExceeded` when the value needs more digits than that — with
+// the value's bit length and `digits * 4`, so the message can say which
+// way round the two are.
+pub fn nat_to_hex_padded(a: BigNat, digits: Int) -> Result<Str, BigFault> []
+    todo("bigint-nv.bigfmt.nat_to_hex_padded")
+
+// A magnitude parsed from base-10 digits.
+//
+// `_` separators are accepted BETWEEN digits and nowhere else, which is
+// what makes a 617-digit RSA modulus in a source file readable; a
+// leading, trailing or doubled separator is `BigBadSeparator` with its
+// offset.  No sign is accepted at all — a magnitude has none, and the
+// signed parse is `parse`.
+//
+// `BigEmptyText` for an empty string, `BigBadDigit` with the offset for
+// anything that is not a digit.
+//
+// ```novo
+// use bigfmt
+//
+// fn main() [io]
+//     match bigfmt.nat_parse_decimal("1_000_000")
+//         Ok(a)  => println(bigfmt.nat_to_decimal(a))   // 1000000
+//         Err(e) => println(e.message())
+// ```
+pub fn nat_parse_decimal(text: Str) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigfmt.nat_parse_decimal")
+
+// A magnitude parsed in `radix`, 2 to 36, letters in either case.
+//
+// `BigBadRadix`, `BigEmptyText`, `BigBadDigit`, `BigBadSeparator` as
+// above.  NO `0x`, `0b` or `0o` prefix is recognised: the radix is the
+// argument, and a package that also read a prefix would have two
+// sources of truth for one fact.
+pub fn nat_parse_radix(text: Str, radix: Int) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigfmt.nat_parse_radix")
+
+// A magnitude parsed from hexadecimal digits, either case, `_`
+// separators between digits.
+//
+// The call a program reading a key out of a configuration file makes.
+pub fn nat_parse_hex(text: Str) -> Result<BigNat, BigFault> []
+    todo("bigint-nv.bigfmt.nat_parse_hex")
+
+// ── the signed directions ───────────────────────────────────────────
+
+// The signed number as base-10 digits, with a leading `-` when it is
+// negative and nothing when it is not.
+//
+// `"0"` for zero, and no `+`.
+//
+// ```novo
+// use bignum
+// use bigfmt
+//
+// fn main() [io]
+//     println(bigfmt.to_decimal(bignum.from_int(-42)))   // -42
+// ```
+pub fn to_decimal(n: BigNum) -> Str []
+    todo("bigint-nv.bigfmt.to_decimal")
+
+// The signed number in `radix`, 2 to 36, with a leading `-` when
+// negative.  `BigBadRadix` outside the range.
+pub fn to_radix(n: BigNum, radix: Int) -> Result<Str, BigFault> []
+    todo("bigint-nv.bigfmt.to_radix")
+
+// A signed number parsed from base-10 digits with an optional leading
+// `+` or `-`.
+//
+// The sign, if present, is the first character; a separator between the
+// sign and the first digit is `BigBadSeparator(at: 1)` rather than
+// something quietly accepted.
+//
+// ```novo
+// use bigfmt
+//
+// fn main() [io]
+//     match bigfmt.parse("-1_000")
+//         Ok(n)  => println(bigfmt.to_decimal(n))   // -1000
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(text: Str) -> Result<BigNum, BigFault> []
+    todo("bigint-nv.bigfmt.parse")
+
+// A signed number parsed in `radix`, 2 to 36, with an optional sign.
+pub fn parse_radix(text: Str, radix: Int) -> Result<BigNum, BigFault> []
+    todo("bigint-nv.bigfmt.parse_radix")
+
+// ── bytes ───────────────────────────────────────────────────────────
+
+// A magnitude from big-endian bytes.
+//
+// Leading zero bytes are accepted and dropped, an empty input is zero,
+// and nothing is refused: every byte string is a number.  This is the
+// call that turns an RSA modulus, a curve scalar or a hash into
+// something to compute with.
+//
+// ```novo
+// use std.bytes
+// use bignum
+// use bigfmt
+//
+// fn main() [io]
+//     let b = bytes.from_byte_list([1, 0])
+//     println("${bignum.limb_count(bigfmt.nat_from_be_bytes(b))}")   // 1
+// ```
+pub fn nat_from_be_bytes(b: Bytes) -> BigNat []
+    todo("bigint-nv.bigfmt.nat_from_be_bytes")
+
+// The magnitude as big-endian bytes, shortest form: no leading zero
+// byte, and EMPTY for zero.
+//
+// Empty and not a single `0x00`, because the inverse of
+// `nat_from_be_bytes` is what makes a round trip a round trip, and an
+// implementation that answered one byte here would not round-trip the
+// empty input.  A caller who wants a fixed width uses the next one,
+// which is the one the crypto tier always wants.
+pub fn nat_to_be_bytes(a: BigNat) -> Bytes []
+    todo("bigint-nv.bigfmt.nat_to_be_bytes")
+
+// The magnitude as EXACTLY `len` big-endian bytes, zero-padded on the
+// left.
+//
+// `BigBadByteLength` with the shortest length and `len` when the value
+// does not fit.
+//
+// This is the encoding every wire format in the crypto tier uses: a
+// P-256 coordinate is 32 bytes whatever its leading byte is, an RSA
+// signature is as many bytes as the modulus, and a leading zero that
+// got stripped is a value that verifies nowhere.  p256-nv's
+// `public_key_from_bytes` takes two of these.
+//
+// ```novo
+// use std.bytes
+// use bignum
+// use bigfmt
+//
+// fn main() [io]
+//     match bignum.nat_from_int(1)
+//         Ok(a) =>
+//             match bigfmt.nat_to_be_bytes_padded(a, 4)
+//                 Ok(b)  => println("${bytes.len(b)}")   // 4
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn nat_to_be_bytes_padded(a: BigNat, len: Int) -> Result<Bytes, BigFault> []
+    todo("bigint-nv.bigfmt.nat_to_be_bytes_padded")
+
+// How many bytes `nat_to_be_bytes` would answer: `(bit_len + 7) / 8`,
+// and 0 for zero.
+//
+// A caller sizing a buffer asks this instead of encoding twice.
+pub fn nat_byte_len(a: BigNat) -> Int []
+    todo("bigint-nv.bigfmt.nat_byte_len")
+
+// A signed number from a sign and big-endian magnitude bytes.
+//
+// The sign is separate because a big-endian byte string carries none:
+// PKCS#1, SEC 1 and every other format this package will meet encode
+// magnitudes and say the sign elsewhere, and a function that read a
+// top bit as a sign would misread every 2048-bit modulus whose leading
+// byte happens to be above `0x7f` — which is half of them.
+//
+// The DER convention, where a leading `0x00` exists precisely to stop
+// that misreading, belongs to asn1-nv and not here.
+pub fn from_sign_be_bytes(sign: Int, b: Bytes) -> BigNum []
+    todo("bigint-nv.bigfmt.from_sign_be_bytes")
+
+// The signed number's magnitude as big-endian bytes, shortest form.
+//
+// The sign is dropped, because there is nowhere in a byte string to put
+// it; `bignum.sign` is how a caller carries it alongside.
+pub fn to_be_bytes(n: BigNum) -> Bytes []
+    todo("bigint-nv.bigfmt.to_be_bytes")
