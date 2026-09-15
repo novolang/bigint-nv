@@ -1,6 +1,6 @@
 [package]
 name        = "bigint-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Arbitrary-precision integers in novo-lang itself: unsigned magnitudes over 28-bit limb lists, signed numbers over them, schoolbook and Karatsuba multiplication, division with remainder, shifts, bitwise operations, decimal and hexadecimal text, big-endian bytes, and the modular arithmetic the crypto tier needs — modular exponentiation, modular inverse, Montgomery form as a value built once per modulus, and fixed-width 256-, 2048- and 4096-bit types for curve and RSA sizes.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
