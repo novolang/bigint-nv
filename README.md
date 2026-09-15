@@ -221,10 +221,10 @@ value.
   refuses one (SPEC section 14.4). The fixed-width types in `bigfix` do
   not change that: they are boxed structs holding lists, because a
   `@value` struct may not be the payload of a `Result` and every
-  constructor here can refuse. A device that needs 256-bit field
-  arithmetic wants a value type with an inline array, which is a
-  different package. This one makes no device claim and ships no device
-  probe.
+  constructor here can refuse. A device that needs 256-bit field arithmetic
+  wants a value type with an inline array, which is a different package.
+  Nothing here is claimed to build for a device with no heap allocator, and
+  there is no `tests/embedded_probe.nv`.
 - **A module named `bigint`, and a type named `BigInt`.** Both names
   belong to the standard library, and a package may neither ship a
   module named after a standard library module nor redeclare a standard
